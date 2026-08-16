@@ -10,6 +10,7 @@ add_executable(context_overlay WIN32
     src/main.cpp
     src/overlay_window.cpp
     src/dwell_coordinator.cpp
+    src/uia_identity.cpp
 )
 
 target_compile_definitions(context_overlay PRIVATE
@@ -19,12 +20,18 @@ target_compile_definitions(context_overlay PRIVATE
     NOMINMAX
 )
 
-# Phase One links only what it actually uses. Later phases add, per the
-# architecture document:
-#   ole32 oleaut32 uiautomationcore d2d1 dwrite winhttp
+# Link budget, per the architecture document's phased plan:
+#   Phase 1: user32 gdi32
+#   Phase 2 (+UIA identity): ole32 (COM) oleaut32 (BSTR/SysFreeString)
+#   Phase 3 (text grabber): + uiautomationcore   [no MinGW import lib; resolved
+#       at runtime via CoCreateInstance, so not added as a link dependency here]
+#   Phase 4 (backend):       + winhttp
+#   Phase 5 (renderer):      + d2d1 dwrite
 target_link_libraries(context_overlay PRIVATE
     user32
     gdi32
+    ole32
+    oleaut32
 )
 
 if(MSVC)

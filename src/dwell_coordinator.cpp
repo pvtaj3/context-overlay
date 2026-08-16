@@ -2,8 +2,51 @@
 
 #include <windows.h>
 
+#include <objbase.h>
+
+#include <thread>
+#include <utility>
+
+#include "config.h"
+#include "uia_identity.h"
+
+namespace {
+
+// Resolve the hover identity off the UI thread, in a fresh STA apartment, then
+// hand a HoverTarget back through the dwell callback. Mirrors the architecture's
+// threading model: the UI/message thread never calls UI Automation.
+void resolveIdentityAndReport(std::shared_ptr<DwellCoordinator::Shared> shared,
+                              POINT point, uint64_t generation,
+                              std::chrono::steady_clock::time_point stableSince) {
+    // Own STA for the lifetime of this probe.
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        // Already initialized on this thread (shouldn't happen for a fresh
+        // detached thread, but tolerate it).
+    }
+
+    auto identity = identifyAt(point, config::kUiaDeadlineMs);
+
+    // Arbitration: if the hover was superseded or the coordinator is gone,
+    // drop the result. UIA objects are released inside identifyAt.
+    const bool stillValid =
+        shared && shared->alive.load() && shared->generation.load() == generation;
+    if (stillValid && identity && shared->onDwell) {
+        HoverTarget target{};
+        target.screenPoint = point;
+        target.hwnd = identity->hwnd;
+        target.elementHash = identity->elementHash;
+        target.stableSince = stableSince;
+        shared->onDwell(target, generation);
+    }
+
+    CoUninitialize();
+}
+
+}  // namespace
+
 void DwellCoordinator::sample(POINT point) {
     const auto now = std::chrono::steady_clock::now();
+    auto shared = shared_;
 
     // Any movement beyond the stability radius breaks the current hover.
     if (!haveLast_ || !isStable(point, lastPoint_)) {
@@ -12,7 +55,11 @@ void DwellCoordinator::sample(POINT point) {
         haveLast_ = true;
         lastPoint_ = point;
         state_ = State::Idle;
-        if (wasActive && onCancel_) onCancel_();
+        if (wasActive) {
+            ++shared->generation;  // supersede any in-flight probe
+            ++telemetry_.canceled;
+            if (shared->onCancel) shared->onCancel();
+        }
         return;
     }
 
@@ -20,7 +67,9 @@ void DwellCoordinator::sample(POINT point) {
 
     switch (state_) {
         case State::Idle:
-            // First stable sample: start the dwell clock.
+            // Start of a new hover epoch: bump generation so any probe from a
+            // previous hover is now stale.
+            ++shared->generation;
             state_ = State::Pending;
             stableSince_ = now;
             break;
@@ -29,8 +78,14 @@ void DwellCoordinator::sample(POINT point) {
             if (std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - stableSince_) >= dwell_) {
                 state_ = State::Fired;
-                ++generation_;
-                if (onDwell_) onDwell_(point);
+                ++telemetry_.dwellFired;
+                const uint64_t gen = shared->generation.load();
+                const auto since = stableSince_;
+                // Detached worker: keeps `shared` alive, never blocks the UI
+                // thread (no join), and exits cleanly if alive flips to false.
+                std::thread([shared, point, gen, since]() {
+                    resolveIdentityAndReport(shared, point, gen, since);
+                }).detach();
             }
             break;
 
@@ -41,7 +96,12 @@ void DwellCoordinator::sample(POINT point) {
 }
 
 void DwellCoordinator::cancel() {
-    if (state_ != State::Idle && onCancel_) onCancel_();
+    auto shared = shared_;
+    if (state_ != State::Idle) {
+        ++shared->generation;
+        ++telemetry_.canceled;
+        if (shared->onCancel) shared->onCancel();
+    }
     state_ = State::Idle;
     haveLast_ = false;
 }
