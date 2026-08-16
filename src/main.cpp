@@ -3,6 +3,7 @@
 #include <objbase.h>
 
 #include "config.h"
+#include "diag.h"
 #include "dwell_coordinator.h"
 #include "overlay_window.h"
 #include "types.h"
@@ -24,6 +25,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
+    diag::logf(L"=== context_overlay start (coHr=0x%08lX) ===",
+               static_cast<unsigned long>(coHr));
+
     OverlayWindow overlay;
     if (!overlay.create(hInstance)) {
         MessageBoxW(nullptr, L"Failed to create the overlay window.",
@@ -38,6 +42,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     // from a previous hover is discarded. The overlay is only ever touched from
     // this (UI) thread: the STA worker posts kDwellResultMessage to the overlay
     // window and the pump below turns that into the onDwell call.
+    diag::logf(L"overlay window created hwnd=0x%p",
+               static_cast<void*>(overlay.hwnd()));
+
+    // Telemetry snapshot rendered on the card. Refreshed on the UI thread right
+    // before each present, so the counters shown are current.
+    OverlayWindow::Counters counters{};
+    overlay.setCounters(&counters);
+
+    DwellCoordinator* coordinatorPtr = nullptr;
     DwellCoordinator coordinator(
         overlay.hwnd(),
         config::kDwellThreshold,
@@ -45,9 +58,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         config::kStabilityRadiusPx,
         [&](const HoverTarget& target, uint64_t generation) {
             (void)generation;  // arbitration already applied before delivery
+            if (coordinatorPtr) {
+                counters.dwell = coordinatorPtr->dwellCount();
+                counters.identityFail = coordinatorPtr->identityFailCount();
+                counters.cancel = coordinatorPtr->cancelCount();
+            }
             overlay.showIdentity(target);
         },
         [&]() { overlay.hide(); });
+    coordinatorPtr = &coordinator;
 
     // Sample the cursor on a periodic timer. This is the architecture's
     // recommended approach: no global hook, no interference with native input.
@@ -71,6 +90,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
+    diag::logf(L"=== context_overlay exit (dwell=%llu fail=%llu cancel=%llu) ===",
+               static_cast<unsigned long long>(coordinator.dwellCount()),
+               static_cast<unsigned long long>(coordinator.identityFailCount()),
+               static_cast<unsigned long long>(coordinator.cancelCount()));
     KillTimer(overlay.hwnd(), 1);
     if (comInitialized) CoUninitialize();
     return 0;

@@ -1,5 +1,9 @@
 #include "overlay_window.h"
 #include "config.h"
+#include "diag.h"
+
+#include <cstdio>
+#include <cwchar>
 
 #include <windows.h>
 
@@ -131,7 +135,6 @@ void OverlayWindow::showCardAt(POINT anchor) {
     HDC memdc = CreateCompatibleDC(nullptr);
     HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
     paintCard(memdc, w, h, anchor);
-    SelectObject(memdc, old);
 
     // Composite the DIB as a layered surface. AlphaFormat = 0 means we use a
     // single global alpha (kCardAlpha); per-pixel alpha arrives with D2D later.
@@ -143,10 +146,17 @@ void OverlayWindow::showCardAt(POINT anchor) {
     bf.SourceConstantAlpha = config::kCardAlpha;
     bf.AlphaFormat = 0;
 
+    // UpdateLayeredWindow reads the bitmap OUT OF the source DC, so the DIB must
+    // still be selected here. Deselecting before this call (the original bug)
+    // makes it read the DC's default 1x1 monochrome bitmap and composite
+    // nothing, leaving the overlay permanently invisible.
     SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc, &ptSrc,
-                        RGB(0, 0, 0), &bf, ULW_ALPHA);
+    const BOOL ok = UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc,
+                                        &ptSrc, RGB(0, 0, 0), &bf, ULW_ALPHA);
+    if (!ok) diag::logf(L"UpdateLayeredWindow FAILED err=%lu", GetLastError());
+
+    SelectObject(memdc, old);  // restore only after compositing
     DeleteDC(memdc);
 }
 
@@ -155,7 +165,7 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     // dwell/arbitration behaviour is observable. The real D2D card (Phase 5+)
     // will replace this.
     const int w = config::kCardWidth + 60;
-    const int h = config::kCardHeight + 24;
+    const int h = config::kCardHeight + 46;  // room for the telemetry line
 
     RECT wa{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
@@ -181,9 +191,11 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     wchar_t l1[96];
     wsprintfW(l1, L"Phase 2  -  identity");
     wchar_t l2[96];
-    wsprintfW(l2, L"hwnd=0x%p  hash=%016llX",
-              static_cast<void*>(target.hwnd),
-              static_cast<unsigned long long>(target.elementHash));
+    // _snwprintf, not wsprintfW: the Win32 formatter does not support %016llX,
+    // so the element hash previously rendered as garbage.
+    _snwprintf(l2, 96, L"hwnd=0x%p  hash=%016llX",
+               static_cast<void*>(target.hwnd),
+               static_cast<unsigned long long>(target.elementHash));
 
     RECT rc{0, 0, w, h};
     rc.left += 12;
@@ -191,7 +203,19 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     DrawTextW(memdc, l1, -1, &rc, DT_LEFT);
     rc.top += 22;
     DrawTextW(memdc, l2, -1, &rc, DT_LEFT);
-    SelectObject(memdc, old);
+
+    // Telemetry line: makes dwell / identity-fail / cancel counts observable at
+    // runtime. Without this the identityFail fix cannot be confirmed by running
+    // the app at all.
+    if (counters_) {
+        wchar_t l3[96];
+        _snwprintf(l3, 96, L"dwell=%llu  fail=%llu  cancel=%llu",
+                   static_cast<unsigned long long>(counters_->dwell),
+                   static_cast<unsigned long long>(counters_->identityFail),
+                   static_cast<unsigned long long>(counters_->cancel));
+        rc.top += 22;
+        DrawTextW(memdc, l3, -1, &rc, DT_LEFT);
+    }
 
     POINT ptSrc{0, 0};
     POINT ptPos{x, y};
@@ -201,10 +225,15 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     bf.SourceConstantAlpha = config::kCardAlpha;
     bf.AlphaFormat = 0;
 
+    // As in showCardAt: the DIB must remain selected into memdc across this call.
     SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc, &ptSrc,
-                        RGB(0, 0, 0), &bf, ULW_ALPHA);
+    const BOOL ok = UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc,
+                                        &ptSrc, RGB(0, 0, 0), &bf, ULW_ALPHA);
+    diag::logf(L"showIdentity: pos=(%d,%d) size=%dx%d ulw=%d err=%lu",
+               x, y, w, h, ok ? 1 : 0, ok ? 0UL : GetLastError());
+
+    SelectObject(memdc, old);  // restore only after compositing
     DeleteDC(memdc);
 }
 
