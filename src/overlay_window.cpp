@@ -150,6 +150,64 @@ void OverlayWindow::showCardAt(POINT anchor) {
     DeleteDC(memdc);
 }
 
+void OverlayWindow::showIdentity(const HoverTarget& target) {
+    // Phase Two: a wider card that surfaces the resolved identity so the
+    // dwell/arbitration behaviour is observable. The real D2D card (Phase 5+)
+    // will replace this.
+    const int w = config::kCardWidth + 60;
+    const int h = config::kCardHeight + 24;
+
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = target.screenPoint.x + 16;
+    int y = target.screenPoint.y + 16;
+    if (x + w > wa.right) x = target.screenPoint.x - w - 16;
+    if (y + h > wa.bottom) y = target.screenPoint.y - h - 16;
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top) y = wa.top;
+
+    ensureDib(w, h);
+
+    HDC memdc = CreateCompatibleDC(nullptr);
+    HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
+    paintCard(memdc, w, h, target.screenPoint);
+
+    // Identity text lines (drawn over the base card background).
+    SetBkMode(memdc, TRANSPARENT);
+    SetTextColor(memdc, RGB(232, 234, 238));
+    HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    SelectObject(memdc, font);
+
+    wchar_t l1[96];
+    wsprintfW(l1, L"Phase 2  -  identity");
+    wchar_t l2[96];
+    wsprintfW(l2, L"hwnd=0x%p  hash=%016llX",
+              static_cast<void*>(target.hwnd),
+              static_cast<unsigned long long>(target.elementHash));
+
+    RECT rc{0, 0, w, h};
+    rc.left += 12;
+    rc.top += 12;
+    DrawTextW(memdc, l1, -1, &rc, DT_LEFT);
+    rc.top += 22;
+    DrawTextW(memdc, l2, -1, &rc, DT_LEFT);
+    SelectObject(memdc, old);
+
+    POINT ptSrc{0, 0};
+    POINT ptPos{x, y};
+    SIZE size{w, h};
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = config::kCardAlpha;
+    bf.AlphaFormat = 0;
+
+    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc, &ptSrc,
+                        RGB(0, 0, 0), &bf, ULW_ALPHA);
+    DeleteDC(memdc);
+}
+
 void OverlayWindow::hide() {
     ShowWindow(hwnd_, SW_HIDE);
 }

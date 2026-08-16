@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include "types.h"
+
 // A topmost, transparent, click-through layered window.
 //
 // Phase One responsibility: own the Win32 window, keep it non-activating and
@@ -13,6 +15,7 @@ class OverlayWindow {
 public:
     bool create(HINSTANCE instance);
     void showCardAt(POINT anchor);
+    void showIdentity(const HoverTarget& target);
     void hide();
     HWND hwnd() const { return hwnd_; }
 

@@ -26,4 +26,14 @@ inline constexpr int kCardHeight{84};
 // single global alpha multiply; the card has no per-pixel alpha yet.
 inline constexpr BYTE kCardAlpha{200};
 
+// Phase Two: wall-clock deadline for the UI Automation identity probe. UI
+// Automation cancellation is not universal across providers, so we abandon stale
+// results after this budget rather than block on them.
+inline constexpr DWORD kUiaDeadlineMs{400};
+
+// Phase Two: how long the card stays shown before re-probing identity when the
+// cursor rests on a *new* element. Kept short; the dwell coordinator already
+// arbitrates via its generation counter.
+inline constexpr std::chrono::milliseconds kIdentityRefresh{800};
+
 }  // namespace config
