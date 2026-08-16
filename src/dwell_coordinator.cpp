@@ -42,7 +42,19 @@ void resolveIdentityAndReport(std::shared_ptr<DwellCoordinator::Shared> shared,
                static_cast<unsigned long long>(generation),
                static_cast<unsigned long>(coHr));
 
+    // Measure the probe so the deadline fix is provable from the log rather than
+    // merely survivable: against a hung provider this must land near
+    // kUiaDeadlineMs, not at the UIA default of roughly two minutes.
+    const ULONGLONG probeStart = GetTickCount64();
     auto identity = identifyAt(point, config::kUiaDeadlineMs);
+    const ULONGLONG probeMs = GetTickCount64() - probeStart;
+
+    diag::logf(L"worker: probe took %llu ms (deadline=%lu)%s",
+               static_cast<unsigned long long>(probeMs),
+               static_cast<unsigned long>(config::kUiaDeadlineMs),
+               probeMs > (config::kUiaDeadlineMs * 3)
+                   ? L"  *** DEADLINE OVERRUN ***"
+                   : L"");
 
     if (!identity) {
         // Resolution genuinely failed (no UIA, protected surface, deadline hit

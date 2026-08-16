@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 
+#include "diag.h"
 #include "identity_hash.h"
 
 // CLSID_CUIAutomation / IID_IUIAutomation as real definitions (not DEFINE_GUID,
@@ -174,10 +175,19 @@ std::optional<HoverIdentity> identifyAt(POINT point, DWORD deadlineMs) {
             kIidIUIAutomation2, reinterpret_cast<void**>(&automation2))) &&
         automation2) {
         const DWORD budget = deadline.remaining();
-        automation2->put_ConnectionTimeout(budget);
-        automation2->put_TransactionTimeout(budget);
+        const HRESULT hrConn = automation2->put_ConnectionTimeout(budget);
+        const HRESULT hrTxn = automation2->put_TransactionTimeout(budget);
         // Never let a probe move focus in the target app.
         automation2->put_AutoSetFocus(FALSE);
+        diag::logf(L"uia: IUIAutomation2 OK, timeouts=%lu ms (conn=0x%08lX txn=0x%08lX)",
+                   static_cast<unsigned long>(budget),
+                   static_cast<unsigned long>(hrConn),
+                   static_cast<unsigned long>(hrTxn));
+    } else {
+        // Without IUIAutomation2 we cannot bound the provider call itself; only
+        // the between-call deadline checks apply, which cannot interrupt a call
+        // already blocked inside a hung provider. Worth knowing in the log.
+        diag::logf(L"uia: IUIAutomation2 UNAVAILABLE - provider calls are unbounded");
     }
 
     HoverIdentity out;
@@ -194,8 +204,15 @@ std::optional<HoverIdentity> identifyAt(POINT point, DWORD deadlineMs) {
     bool haveRuntimeId = false;
 
     IUIAutomationElement* element = nullptr;
-    if (!deadline.expired() &&
-        SUCCEEDED(automation->ElementFromPoint(point, &element)) && element) {
+    const ULONGLONG efpStart = GetTickCount64();
+    const HRESULT efpHr = deadline.expired()
+                              ? E_ABORT
+                              : automation->ElementFromPoint(point, &element);
+    diag::logf(L"uia: ElementFromPoint hr=0x%08lX took %llu ms elem=%d",
+               static_cast<unsigned long>(efpHr),
+               static_cast<unsigned long long>(GetTickCount64() - efpStart),
+               element ? 1 : 0);
+    if (SUCCEEDED(efpHr) && element) {
         // Stable identity from the runtime id when available.
         if (!deadline.expired()) {
             SAFEARRAY* rid = nullptr;
