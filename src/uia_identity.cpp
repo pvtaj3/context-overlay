@@ -1,7 +1,11 @@
 #include "uia_identity.h"
 
+// INITGUID must be defined BEFORE the UIA header so its DEFINE_GUID entries
+// become real definitions in this translation unit.
+#define INITGUID
 #include <windows.h>
 
+#include <guiddef.h>
 #include <objbase.h>
 #include <uiautomationclient.h>
 
@@ -13,20 +17,20 @@
 #include "diag.h"
 #include "identity_hash.h"
 
-// CLSID_CUIAutomation / IID_IUIAutomation as real definitions (not DEFINE_GUID,
-// which without INITGUID is only an external reference and would fail to link).
-// We never link uiautomationcore.lib — the DLL is resolved by CoCreateInstance.
-static const CLSID kClsidCUIAutomation = {
-    0xFF48DBA4, 0x60EF, 0x4201,
-    {0xAA, 0x87, 0x54, 0x10, 0x3E, 0xEF, 0x59, 0x4E}};
-static const IID kIidIUIAutomation = {
-    0x50A2FA23, 0xAEA1, 0x465B,
-    {0x98, 0x47, 0x25, 0x06, 0x5D, 0x67, 0xFE, 0x2F}};
-// IUIAutomation2 {34723aff-0c9d-49d0-9896-7ab52df8cd8a} — adds the
-// connection/transaction timeout knobs used to bound a hung provider.
-static const IID kIidIUIAutomation2 = {
-    0x34723AFF, 0x0C9D, 0x49D0,
-    {0x98, 0x96, 0x7A, 0xB5, 0x2D, 0xF8, 0xCD, 0x8A}};
+// UIA GUIDs.
+//
+// The SDK declares these with DEFINE_GUID, which without INITGUID is only an
+// external reference and would fail to link (we never link uiautomationcore --
+// the DLL is resolved at runtime by CoCreateInstance). Defining INITGUID before
+// the include makes DEFINE_GUID emit real definitions, so we get the SDK's own
+// values rather than hand-transcribed ones.
+//
+// Hand-transcribing these is a genuine hazard: an earlier revision carried a
+// fabricated IID_IUIAutomation (50A2FA23-...), which made CoCreateInstance fail
+// with E_NOINTERFACE on every probe. UIA was therefore never used at all -- the
+// code silently fell back to an HWND-only identity, and because that fallback
+// still produced a plausible-looking hash on a visible card, the failure was
+// invisible. Never type a GUID by hand; let the SDK define it.
 
 namespace {
 
@@ -150,13 +154,18 @@ std::optional<HoverIdentity> identifyAt(POINT point, DWORD deadlineMs) {
     HWND owner = ownerWindowAt(point);
 
     IUIAutomation* automation = nullptr;
-    HRESULT hr = CoCreateInstance(kClsidCUIAutomation, nullptr,
-                                  CLSCTX_INPROC_SERVER, kIidIUIAutomation,
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_IUIAutomation,
                                   reinterpret_cast<void**>(&automation));
     if (FAILED(hr) || !automation) {
-        // No UIA at all. A window alone is still a usable (weak) identity; with
-        // nothing at all there is nothing to report and the caller counts a
-        // resolution failure.
+        // No UIA at all. Log it loudly: a silent fallback here still produces a
+        // plausible HWND-only hash, which is exactly how a bad IID went
+        // unnoticed. This is never normal on Windows 7+.
+        diag::logf(L"uia: CoCreateInstance FAILED hr=0x%08lX - "
+                   L"falling back to HWND-only identity",
+                   static_cast<unsigned long>(hr));
+        // A window alone is still a usable (weak) identity; with nothing at all
+        // there is nothing to report and the caller counts a resolution failure.
         if (!owner) return std::nullopt;
         HoverIdentity weak;
         weak.hwnd = owner;
@@ -172,7 +181,7 @@ std::optional<HoverIdentity> identifyAt(POINT point, DWORD deadlineMs) {
     // (two minutes) regardless of any budget we track on our side.
     IUIAutomation2* automation2 = nullptr;
     if (SUCCEEDED(automation->QueryInterface(
-            kIidIUIAutomation2, reinterpret_cast<void**>(&automation2))) &&
+            IID_IUIAutomation2, reinterpret_cast<void**>(&automation2))) &&
         automation2) {
         const DWORD budget = deadline.remaining();
         const HRESULT hrConn = automation2->put_ConnectionTimeout(budget);
