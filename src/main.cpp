@@ -11,27 +11,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     // Initialize COM on the UI thread per the architecture's startup sequence.
     // UI Automation itself runs on a dedicated STA worker (see the coordinator),
     // but initializing here keeps the process apartment model well-defined.
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    //
+    // S_OK and S_FALSE both mean "this thread is initialized, balance it with
+    // CoUninitialize". RPC_E_CHANGED_MODE means the thread already belongs to a
+    // different apartment model and we must NOT uninitialize it. Any other
+    // failure is fatal for our purposes.
+    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool comInitialized = (coHr == S_OK || coHr == S_FALSE);
+    if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE) {
+        MessageBoxW(nullptr, L"Failed to initialize COM.", L"Context Overlay",
+                    MB_ICONERROR);
+        return 1;
+    }
 
     OverlayWindow overlay;
     if (!overlay.create(hInstance)) {
         MessageBoxW(nullptr, L"Failed to create the overlay window.",
                     L"Context Overlay", MB_ICONERROR);
-        CoUninitialize();
+        if (comInitialized) CoUninitialize();
         return 1;
     }
 
     // Phase Two: dwell now resolves a HoverTarget (anchor + HWND + stable
-    // element hash) off-thread and reports it with its generation. Movement or
-    // an explicit cancel bumps the generation, so any slow probe from a previous
-    // hover is discarded.
+    // element hash) off-thread and marshals it back here with its generation.
+    // Movement or an explicit cancel bumps the generation, so any slow probe
+    // from a previous hover is discarded. The overlay is only ever touched from
+    // this (UI) thread: the STA worker posts kDwellResultMessage to the overlay
+    // window and the pump below turns that into the onDwell call.
     DwellCoordinator coordinator(
+        overlay.hwnd(),
         config::kDwellThreshold,
         config::kSampleInterval,
         config::kStabilityRadiusPx,
         [&](const HoverTarget& target, uint64_t generation) {
-            (void)generation;  // arbitration lives in the pipeline (Phase 3+);
-                                // here we simply render the resolved identity.
+            (void)generation;  // arbitration already applied before delivery
             overlay.showIdentity(target);
         },
         [&]() { overlay.hide(); });
@@ -48,10 +61,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             if (GetCursorPos(&p)) coordinator.sample(p);
             continue;
         }
+        // Identity resolved by an STA worker: presentation happens here, on the
+        // thread that owns the overlay window.
+        if (msg.message == DwellCoordinator::kDwellResultMessage) {
+            DwellCoordinator::deliverPosted(msg.wParam, msg.lParam);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    CoUninitialize();
+    KillTimer(overlay.hwnd(), 1);
+    if (comInitialized) CoUninitialize();
     return 0;
 }
