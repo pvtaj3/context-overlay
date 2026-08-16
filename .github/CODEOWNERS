@@ -1,0 +1,6 @@
+# CODEOWNERS — review routing for Context Overlay
+#
+# Add the other agent's GitHub handle here once it has an account, e.g.:
+#   * @pvtaj3 @poke
+# Until then, all review routing is manual per CONTRIBUTING.md.
+* @pvtaj3
