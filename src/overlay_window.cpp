@@ -1,13 +1,16 @@
 #include "overlay_window.h"
 #include "config.h"
 #include "diag.h"
+#include "theme_tokens.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cwchar>
 
 #include <windows.h>
 
 namespace {
+
 constexpr UINT WM_SHOW_CARD = WM_APP + 1;
 constexpr UINT WM_HIDE_CARD = WM_APP + 2;
 
@@ -30,6 +33,103 @@ void enableDpiAwareness() {
     }
     SetProcessDPIAware();
 }
+
+// --- Windows 11 / WinUI DWM glue (issue #2) ----------------------------------
+//
+// These attributes and color values are resolved dynamically so the binary
+// builds against older SDKs and still lights up the native styling on Windows
+// 11. On systems that lack them (Win10, disabled composition) we take the
+// documented graceful fallbacks and rely on the GDI card's own palette.
+
+// DWM window attributes for system backdrop material + rounded corners.
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+
+// DWM_SYSTEMBACKDROP_TYPE values (subset we use).
+enum class DwmBackdrop : DWORD {
+    kNone = 1,
+    kMica = 2,
+    kAcrylic = 3,
+};
+
+enum class DwmCorner : DWORD {
+    kDefault = 0,
+    kRound = 2,
+    kRoundSmall = 3,
+};
+
+using DwmSetAttrFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+
+DwmSetAttrFn getDwmSetWindowAttribute() {
+    HMODULE dwm = GetModuleHandleW(L"dwmapi.dll");
+    if (!dwm) return nullptr;
+    return reinterpret_cast<DwmSetAttrFn>(reinterpret_cast<void*>(
+        GetProcAddress(dwm, "DwmSetWindowAttribute")));
+}
+
+// Apply the Win11-native look: rounded corners, immersive dark mode to match
+// the chosen theme, and a system backdrop material (mica/acrylic) when the
+// platform supports it. Every call is guarded by a runtime capability check so
+// an absent API degrades to the GDI card's opaque fallback without error.
+void applyWin11Backdrop(HWND hwnd, theme::ThemeMode mode,
+                        theme::Backdrop backdrop) {
+    auto setAttr = getDwmSetWindowAttribute();
+    if (!setAttr) return;  // older OS: GDI palette + square corners are fine
+
+    // Rounded corners — the heart of the Win11 silhouette.
+    const DwmCorner cornerPref = DwmCorner::kRound;
+    setAttr(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPref,
+            sizeof(cornerPref));
+
+    // Immersive dark mode so the non-client/backdrop tints follow our theme.
+    const BOOL immersive = (mode == theme::kDark) ? TRUE : FALSE;
+    setAttr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &immersive, sizeof(immersive));
+
+    // System backdrop material. kNone means "no backdrop API" — we keep the GDI
+    // card's solid, readable surface instead (see effectiveBackdrop()).
+    DwmBackdrop dwmBackdrop = DwmBackdrop::kNone;
+    switch (backdrop) {
+        case theme::Backdrop::kMica:
+            dwmBackdrop = DwmBackdrop::kMica;
+            break;
+        case theme::Backdrop::kAcrylic:
+            dwmBackdrop = DwmBackdrop::kAcrylic;
+            break;
+        case theme::Backdrop::kNone:
+        default:
+            dwmBackdrop = DwmBackdrop::kNone;
+            break;
+    }
+    setAttr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &dwmBackdrop, sizeof(dwmBackdrop));
+}
+
+// Per-monitor DPI for the overlay's own window (we are PMv2-aware). Falls back
+// to system DPI when the per-window API is unavailable, so corner radii and
+// typography scale correctly regardless of which monitor the card lands on.
+UINT currentDpi(HWND hwnd) {
+    using GetDpiFn = UINT(WINAPI*)(HWND);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        auto f = reinterpret_cast<GetDpiFn>(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetDpiForWindow")));
+        if (f) return f(hwnd);
+    }
+    return GetDpiForSystem();
+}
+
+// COLORREF is BGR; our token Rgb is RGB. Convert so layout assumptions never
+// leak from the platform-neutral header into the renderer.
+constexpr COLORREF toColorref(theme::Rgb c) {
+    return RGB(c.r, c.g, c.b);
+}
+
 }  // namespace
 
 bool OverlayWindow::create(HINSTANCE instance) {
@@ -76,43 +176,155 @@ void OverlayWindow::ensureDib(int width, int height) {
     bi.bmiHeader.biWidth = width;
     bi.bmiHeader.biHeight = -height;  // top-down DIB
     bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biBitCount = 32;     // BGRA: per-pixel alpha for corner masking
     bi.bmiHeader.biCompression = BI_RGB;
     dib_ = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &dibBits_, nullptr, 0);
     width_ = width;
     height_ = height;
 }
 
-void OverlayWindow::paintCard(HDC hdc, int width, int height, POINT anchor) {
-    RECT rc{0, 0, width, height};
+// Paint a themed, rounded, per-pixel-alpha card into the layered DIB. The DIB
+// starts fully transparent; we fill only inside the rounded rectangle, so the
+// composited surface is genuinely masked — no square corners survive.
+HDC OverlayWindow::beginCard(int width, int height,
+                             const theme::ThemeTokens& tokens, int radius,
+                             HBITMAP& outOld) {
+    ensureDib(width, height);
 
-    // Card background.
-    HBRUSH bg = CreateSolidBrush(RGB(26, 27, 33));
-    FillRect(hdc, &rc, bg);
+    // The DIB is created transparent (CreateDIBSection zeroes it), so outside
+    // the rounded rect stays alpha 0.
+
+    HDC memdc = CreateCompatibleDC(nullptr);
+    outOld = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
+
+    // Rounded-rect clip so text/border never spill past the masked corners.
+    HRGN clip = CreateRoundRectRgn(0, 0, width, height, radius * 2, radius * 2);
+    SelectClipRgn(memdc, clip);
+    DeleteObject(clip);
+
+    // Card surface.
+    HBRUSH bg = CreateSolidBrush(toColorref(tokens.cardBg));
+    RECT rc{0, 0, width, height};
+    FillRect(memdc, &rc, bg);
     DeleteObject(bg);
 
-    // Accent border.
-    HBRUSH border = CreateSolidBrush(RGB(96, 165, 250));
-    FrameRect(hdc, &rc, border);
+    // Accent border, inset by 1px so it is not clipped away by the corner mask.
+    HBRUSH border = CreateSolidBrush(toColorref(tokens.accent));
+    RECT br{1, 1, width - 1, height - 1};
+    FrameRect(memdc, &br, border);
     DeleteObject(border);
 
-    // Text.
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(232, 234, 238));
-    HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    SelectObject(hdc, font);
+    // System UI font (Segoe UI on Win11) from NONCLIENTMETRICS, sized for the
+    // card and DPI. Replaced each present because the chosen size is per-card.
+    if (font_) DeleteObject(font_);
+    NONCLIENTMETRICSW ncm{};
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        LOGFONTW lf = ncm.lfMessageFont;
+        lf.lfHeight = -16;  // ~12pt at 96 DPI; GDI scales by the DC's DPI
+        font_ = CreateFontIndirectW(&lf);
+    } else {
+        font_ = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    }
+    SelectObject(memdc, font_);
+    SetBkMode(memdc, TRANSPARENT);
+    SetTextColor(memdc, toColorref(tokens.cardText));
 
-    wchar_t line1[64];
-    wsprintfW(line1, L"Context Overlay  -  Phase 1");
-    wchar_t line2[64];
-    wsprintfW(line2, L"Dwell @ (%ld, %ld)", anchor.x, anchor.y);
+    return memdc;
+}
 
-    RECT textRc = rc;
-    textRc.left += 12;
-    textRc.top += 12;
-    DrawTextW(hdc, line1, -1, &textRc, DT_LEFT);
-    textRc.top += 22;
-    DrawTextW(hdc, line2, -1, &textRc, DT_LEFT);
+// Live OS dark-mode preference, read from the Personalize registry. Falls back
+// to the app default if the key is absent, so absence never breaks the overlay.
+bool OverlayWindow::systemPrefersDark() {
+    DWORD value = 0, size = sizeof(value);
+    constexpr wchar_t kPath[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    const LSTATUS s = RegGetValueW(HKEY_CURRENT_USER, kPath,
+                                   L"AppsUseLightTheme", RRF_RT_REG_DWORD,
+                                   nullptr, &value, &size);
+    if (s != ERROR_SUCCESS) return theme::defaultMode() == theme::kDark;
+    // AppsUseLightTheme=0 -> dark apps. Our card follows the *app* switch.
+    return value == 0;
+}
+
+void OverlayWindow::replay() {
+    if (!visible_) return;
+    if (lastIsIdentity_)
+        showIdentity(lastTarget_);
+    else
+        showCardAt(lastAnchor_);
+}
+
+// Force the DIB alpha channel: opaque inside the rounded rect, transparent in
+// the corner circles. GDI fill/text leave alpha at 0, so without this the
+// entire card would composite as invisible under AC_SRC_ALPHA.
+void OverlayWindow::maskRoundedCorners(int width, int height, int radius,
+                                       unsigned char insideAlpha) {
+    if (!dibBits_) return;
+    auto* px = static_cast<unsigned char*>(dibBits_);  // BGRA, top-down
+    const int r = std::max(radius, 0);
+
+    // Default: every pixel opaque at `insideAlpha`.
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            px[(y * width + x) * 4 + 3] = insideAlpha;
+        }
+    }
+    if (r <= 0) return;  // square card, no corner punch-out needed
+
+    // Punch transparent holes in the four corners (Euclidean inside the circle).
+    const int r2 = r * r;
+    auto insideCorner = [&](int cx, int cy, int x, int y) {
+        const int dx = x - cx, dy = y - cy;
+        return (dx * dx + dy * dy) > r2;
+    };
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            bool transparent = false;
+            if (x < r && y < r)
+                transparent = insideCorner(r, r, x, y);          // top-left
+            else if (x >= width - r && y < r)
+                transparent = insideCorner(width - r, r, x, y);   // top-right
+            else if (x < r && y >= height - r)
+                transparent = insideCorner(r, height - r, x, y);  // bottom-left
+            else if (x >= width - r && y >= height - r)
+                transparent = insideCorner(width - r, height - r, x, y);  // BR
+            if (transparent) px[(y * width + x) * 4 + 3] = 0;
+        }
+    }
+}
+
+// Composite the painted DIB as a layered, click-through, topmost surface and
+// apply the Win11 DWM attributes. The DIB must remain selected into memdc until
+// after UpdateLayeredWindow (the original Phase 1 bug: deselecting early
+// composited nothing).
+void OverlayWindow::endCard(HDC memdc, HBITMAP old, int width, int height,
+                            int x, int y, theme::ThemeMode mode,
+                            theme::Backdrop backdrop, int radius,
+                            unsigned char surfaceAlpha) {
+    // Mask the rounded corners into the alpha channel before compositing.
+    maskRoundedCorners(width, height, radius, surfaceAlpha);
+
+    POINT ptSrc{0, 0};
+    POINT ptPos{x, y};
+    SIZE size{width, height};
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = 255;   // full; per-pixel alpha carries the shape
+    bf.AlphaFormat = AC_SRC_ALPHA;  // honor the DIB's alpha channel (corners)
+
+    // Apply the native Win11 framing to the window *before* it is shown so the
+    // first present already has rounded corners + immersive dark mode.
+    applyWin11Backdrop(hwnd_, mode, backdrop);
+
+    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const BOOL ok = UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc,
+                                        &ptSrc, RGB(0, 0, 0), &bf, ULW_ALPHA);
+    if (!ok) diag::logf(L"UpdateLayeredWindow FAILED err=%lu", GetLastError());
+
+    SelectObject(memdc, old);  // restore only after compositing
+    DeleteDC(memdc);
 }
 
 void OverlayWindow::showCardAt(POINT anchor) {
@@ -130,34 +342,40 @@ void OverlayWindow::showCardAt(POINT anchor) {
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
 
-    ensureDib(w, h);
+    // Theme tokens + scale-aware geometry (issue #2). Follow the OS preference
+    // for now; the runtime preference-change path hooks WM_SETTINGCHANGE.
+    UINT dpi = currentDpi(hwnd_);
+    const int radius = theme::cornerRadiusForDpi(static_cast<int>(dpi));
+    const theme::ThemeMode mode = theme::selectMode(true, systemPrefersDark());
+    const theme::ThemeTokens tokens = theme::resolveTheme(mode);
+    // Backdrop capability: assume supported on this build; the DWM call itself
+    // is a no-op on platforms lacking the API.
+    const theme::Backdrop backdrop =
+        theme::effectiveBackdrop(theme::Backdrop::kMica, true);
+    // Opaque when no material backs us; slightly translucent so mica/acrylic
+    // reads through without harming the WCAG-contrast text.
+    const unsigned char surfaceAlpha =
+        (backdrop == theme::Backdrop::kNone) ? 255 : 235;
 
-    HDC memdc = CreateCompatibleDC(nullptr);
-    HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
-    paintCard(memdc, w, h, anchor);
+    HBITMAP old{};
+    HDC memdc = beginCard(w, h, tokens, radius, old);
 
-    // Composite the DIB as a layered surface. AlphaFormat = 0 means we use a
-    // single global alpha (kCardAlpha); per-pixel alpha arrives with D2D later.
-    POINT ptSrc{0, 0};
-    POINT ptPos{x, y};
-    SIZE size{w, h};
-    BLENDFUNCTION bf{};
-    bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = config::kCardAlpha;
-    bf.AlphaFormat = 0;
+    wchar_t line1[64];
+    wsprintfW(line1, L"Context Overlay  -  Phase 1");
+    wchar_t line2[64];
+    wsprintfW(line2, L"Dwell @ (%ld, %ld)", anchor.x, anchor.y);
 
-    // UpdateLayeredWindow reads the bitmap OUT OF the source DC, so the DIB must
-    // still be selected here. Deselecting before this call (the original bug)
-    // makes it read the DC's default 1x1 monochrome bitmap and composite
-    // nothing, leaving the overlay permanently invisible.
-    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    const BOOL ok = UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc,
-                                        &ptSrc, RGB(0, 0, 0), &bf, ULW_ALPHA);
-    if (!ok) diag::logf(L"UpdateLayeredWindow FAILED err=%lu", GetLastError());
+    RECT textRc{0, 0, w, h};
+    textRc.left += 12;
+    textRc.top += 12;
+    DrawTextW(memdc, line1, -1, &textRc, DT_LEFT);
+    textRc.top += 22;
+    DrawTextW(memdc, line2, -1, &textRc, DT_LEFT);
 
-    SelectObject(memdc, old);  // restore only after compositing
-    DeleteDC(memdc);
+    lastAnchor_ = anchor;
+    lastIsIdentity_ = false;
+    visible_ = true;
+    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha);
 }
 
 void OverlayWindow::showIdentity(const HoverTarget& target) {
@@ -176,17 +394,17 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
 
-    ensureDib(w, h);
+    UINT dpi = currentDpi(hwnd_);
+    const int radius = theme::cornerRadiusForDpi(static_cast<int>(dpi));
+    const theme::ThemeMode mode = theme::selectMode(true, systemPrefersDark());
+    const theme::ThemeTokens tokens = theme::resolveTheme(mode);
+    const theme::Backdrop backdrop =
+        theme::effectiveBackdrop(theme::Backdrop::kMica, true);
+    const unsigned char surfaceAlpha =
+        (backdrop == theme::Backdrop::kNone) ? 255 : 235;
 
-    HDC memdc = CreateCompatibleDC(nullptr);
-    HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
-    paintCard(memdc, w, h, target.screenPoint);
-
-    // Identity text lines (drawn over the base card background).
-    SetBkMode(memdc, TRANSPARENT);
-    SetTextColor(memdc, RGB(232, 234, 238));
-    HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    SelectObject(memdc, font);
+    HBITMAP old{};
+    HDC memdc = beginCard(w, h, tokens, radius, old);
 
     wchar_t l1[96];
     wsprintfW(l1, L"Phase 2  -  identity");
@@ -217,32 +435,20 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
         DrawTextW(memdc, l3, -1, &rc, DT_LEFT);
     }
 
-    POINT ptSrc{0, 0};
-    POINT ptPos{x, y};
-    SIZE size{w, h};
-    BLENDFUNCTION bf{};
-    bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = config::kCardAlpha;
-    bf.AlphaFormat = 0;
-
-    // As in showCardAt: the DIB must remain selected into memdc across this call.
-    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    const BOOL ok = UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc,
-                                        &ptSrc, RGB(0, 0, 0), &bf, ULW_ALPHA);
-    diag::logf(L"showIdentity: pos=(%d,%d) size=%dx%d ulw=%d err=%lu",
-               x, y, w, h, ok ? 1 : 0, ok ? 0UL : GetLastError());
-
-    SelectObject(memdc, old);  // restore only after compositing
-    DeleteDC(memdc);
+    lastTarget_ = target;
+    lastIsIdentity_ = true;
+    visible_ = true;
+    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha);
 }
 
 void OverlayWindow::hide() {
+    visible_ = false;
     ShowWindow(hwnd_, SW_HIDE);
 }
 
 OverlayWindow::~OverlayWindow() {
     if (dib_) DeleteObject(dib_);
+    if (font_) DeleteObject(font_);
 }
 
 LRESULT OverlayWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -262,6 +468,12 @@ LRESULT OverlayWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_HIDE_CARD:
             hide();
+            return 0;
+
+        case WM_SETTINGCHANGE:
+            // System theme / color preference changed: re-present the visible
+            // card under the new theme without waiting for the next dwell.
+            replay();
             return 0;
 
         case WM_DESTROY:

@@ -36,6 +36,7 @@ target_link_libraries(context_overlay PRIVATE
     gdi32
     ole32
     oleaut32
+    advapi32
 )
 
 if(MSVC)
@@ -62,4 +63,11 @@ if(CONTEXT_OVERLAY_BUILD_TESTS)
     add_executable(identity_hash_test tests/identity_hash_test.cpp)
     target_compile_features(identity_hash_test PRIVATE cxx_std_20)
     add_test(NAME identity_hash COMMAND identity_hash_test)
+
+    # Windows 11 / WinUI theme token tests (issue #2). Host-testable because
+    # theme_tokens.h is platform-free: palette contrast, theme selection, and
+    # DPI corner-radius scaling are all verifiable without Windows.
+    add_executable(theme_tokens_test tests/theme_tokens_test.cpp)
+    target_compile_features(theme_tokens_test PRIVATE cxx_std_20)
+    add_test(NAME theme_tokens COMMAND theme_tokens_test)
 endif()

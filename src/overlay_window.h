@@ -4,6 +4,7 @@
 
 #include <cstdint>
 
+#include "theme_tokens.h"
 #include "types.h"
 
 // A topmost, transparent, click-through layered window.
@@ -40,7 +41,38 @@ private:
     LRESULT handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
     void ensureDib(int width, int height);
-    void paintCard(HDC hdc, int width, int height, POINT anchor);
+
+    // Begin painting a themed, rounded card into the layered DIB. Returns a
+    // memory DC with the DIB selected; the caller draws its text lines, then
+    // calls endCard(). The DIB carries per-pixel alpha (transparent outside the
+    // rounded rect) so the layered surface is genuinely masked — no square
+    // corners survive compositing.
+    HDC beginCard(int width, int height, const theme::ThemeTokens& tokens,
+                  int radius, HBITMAP& outOld);
+
+    // Apply DWM Win11 attributes (rounded corners, immersive dark mode, system
+    // backdrop material) and composite the DIB as a layered, click-through
+    // surface. Cleans up the DC and font afterwards. `radius` is the corner
+    // radius in device px; `surfaceAlpha` is the interior alpha (255 = opaque
+    // readable fallback, <255 lets a mica/acrylic backdrop read through).
+    void endCard(HDC memdc, HBITMAP old, int width, int height, int x, int y,
+                 theme::ThemeMode mode, theme::Backdrop backdrop, int radius,
+                 unsigned char surfaceAlpha);
+
+    // Force the DIB's alpha channel: 255 inside the rounded rect (so the card
+    // is opaque/masked) and 0 in the four corners (so they composite as
+    // transparent). Required because GDI fill/text do not set the alpha channel
+    // on a 32bpp DIB — without this pass the whole card composites invisible.
+    void maskRoundedCorners(int width, int height, int radius,
+                           unsigned char insideAlpha);
+
+    // OS dark-mode preference read live from the Personalize registry so the
+    // HUD re-themes when the user flips the system switch (issue #2 #5).
+    static bool systemPrefersDark();
+
+    // Re-present the last visible card under the current theme. Called on
+    // WM_SETTINGCHANGE so a system appearance change repaints in place.
+    void replay();
 
     const Counters* counters_{};
     HWND hwnd_{};
@@ -48,4 +80,12 @@ private:
     void* dibBits_{};      // DIB pixel buffer (owned by dib_)
     int width_{};
     int height_{};
+    HFONT font_{};         // system UI font for the current card (deleted per present)
+
+    // Last presented geometry/target, retained so a theme change can re-present
+    // without waiting for the next dwell.
+    bool visible_{};
+    POINT lastAnchor_{};
+    HoverTarget lastTarget_{};
+    bool lastIsIdentity_{};
 };
