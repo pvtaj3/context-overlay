@@ -81,7 +81,11 @@ DwmSetAttrFn getDwmSetWindowAttribute() {
 void applyWin11Backdrop(HWND hwnd, theme::ThemeMode mode,
                         theme::Backdrop backdrop) {
     auto setAttr = getDwmSetWindowAttribute();
-    if (!setAttr) return;  // older OS: GDI palette + square corners are fine
+    if (!setAttr) {
+        diag::logf(L"win11: DwmSetWindowAttribute unavailable; GDI fallback "
+                    L"(square corners, opaque card)");
+        return;  // older OS: GDI palette + square corners are fine
+    }
 
     // Rounded corners — the heart of the Win11 silhouette.
     const DwmCorner cornerPref = DwmCorner::kRound;
@@ -108,6 +112,12 @@ void applyWin11Backdrop(HWND hwnd, theme::ThemeMode mode,
             break;
     }
     setAttr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &dwmBackdrop, sizeof(dwmBackdrop));
+
+    const wchar_t* bd = backdrop == theme::Backdrop::kMica    ? L"mica"
+                       : backdrop == theme::Backdrop::kAcrylic ? L"acrylic"
+                                                               : L"none";
+    diag::logf(L"win11: corner=round immersive=%d backdrop=%s",
+               immersive ? 1 : 0, bd);
 }
 
 // Per-monitor DPI for the overlay's own window (we are PMv2-aware). Falls back
@@ -317,6 +327,12 @@ void OverlayWindow::endCard(HDC memdc, HBITMAP old, int width, int height,
     // first present already has rounded corners + immersive dark mode.
     applyWin11Backdrop(hwnd_, mode, backdrop);
 
+    diag::logf(L"present: mode=%s dpi=%u radius=%d alpha=%u size=%dx%d "
+                L"pos=(%d,%d)",
+               mode == theme::kDark ? L"dark" : L"light",
+               static_cast<unsigned>(currentDpi(hwnd_)), radius, surfaceAlpha,
+               width, height, x, y);
+
     SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     const BOOL ok = UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc,
@@ -473,6 +489,7 @@ LRESULT OverlayWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SETTINGCHANGE:
             // System theme / color preference changed: re-present the visible
             // card under the new theme without waiting for the next dwell.
+            diag::logf(L"WM_SETTINGCHANGE received; re-presenting under new theme");
             replay();
             return 0;
 
