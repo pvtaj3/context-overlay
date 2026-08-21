@@ -154,9 +154,27 @@ std::optional<HoverIdentity> identifyAt(POINT point, DWORD deadlineMs) {
     HWND owner = ownerWindowAt(point);
 
     IUIAutomation* automation = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr,
+    // CLSID_CUIAutomation8 is the Windows 8+ UIA 3.0 client and is the one that
+    // actually implements IUIAutomation2/3. Creating through it lets the
+    // IUIAutomation2 QueryInterface below succeed, so we can set the provider
+    // timeouts (review item #2 closure). The older CLSID_CUIAutomation (UIA 2.0)
+    // exposes only IUIAutomation on some systems (observed on Windows 11: its V1
+    // coclass does NOT hand out IUIAutomation2, so the QI failed and the deadline
+    // was left to our side-only checks). Fall back to CUIAutomation only if 8 is
+    // unavailable (pre-Windows-8).
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation8, nullptr,
                                   CLSCTX_INPROC_SERVER, IID_IUIAutomation,
                                   reinterpret_cast<void**>(&automation));
+    if (FAILED(hr) || !automation) {
+        diag::logf(L"uia: CLSID_CUIAutomation8 unavailable (hr=0x%08lX) - "
+                   L"falling back to CLSID_CUIAutomation",
+                   static_cast<unsigned long>(hr));
+        hr = CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                              CLSCTX_INPROC_SERVER, IID_IUIAutomation,
+                              reinterpret_cast<void**>(&automation));
+    } else {
+        diag::logf(L"uia: created via CLSID_CUIAutomation8 (UIA 3.0)");
+    }
     if (FAILED(hr) || !automation) {
         // No UIA at all. Log it loudly: a silent fallback here still produces a
         // plausible HWND-only hash, which is exactly how a bad IID went
