@@ -93,7 +93,7 @@ void applyWin11Backdrop(HWND hwnd, theme::ThemeMode mode,
             sizeof(cornerPref));
 
     // Immersive dark mode so the non-client/backdrop tints follow our theme.
-    const BOOL immersive = (mode == theme::kDark) ? TRUE : FALSE;
+    const BOOL immersive = (mode == theme::ThemeMode::kDark) ? TRUE : FALSE;
     setAttr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &immersive, sizeof(immersive));
 
     // System backdrop material. kNone means "no backdrop API" — we keep the GDI
@@ -252,7 +252,7 @@ bool OverlayWindow::systemPrefersDark() {
     const LSTATUS s = RegGetValueW(HKEY_CURRENT_USER, kPath,
                                    L"AppsUseLightTheme", RRF_RT_REG_DWORD,
                                    nullptr, &value, &size);
-    if (s != ERROR_SUCCESS) return theme::defaultMode() == theme::kDark;
+    if (s != ERROR_SUCCESS) return theme::defaultMode() == theme::ThemeMode::kDark;
     // AppsUseLightTheme=0 -> dark apps. Our card follows the *app* switch.
     return value == 0;
 }
@@ -329,7 +329,7 @@ void OverlayWindow::endCard(HDC memdc, HBITMAP old, int width, int height,
 
     diag::logf(L"present: mode=%s dpi=%u radius=%d alpha=%u size=%dx%d "
                 L"pos=(%d,%d)",
-               mode == theme::kDark ? L"dark" : L"light",
+               mode == theme::ThemeMode::kDark ? L"dark" : L"light",
                static_cast<unsigned>(currentDpi(hwnd_)), radius, surfaceAlpha,
                width, height, x, y);
 
