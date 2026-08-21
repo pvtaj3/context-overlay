@@ -53,18 +53,30 @@ private:
     // Apply DWM Win11 attributes (rounded corners, immersive dark mode, system
     // backdrop material) and composite the DIB as a layered, click-through
     // surface. Cleans up the DC and font afterwards. `radius` is the corner
-    // radius in device px; `surfaceAlpha` is the interior alpha (255 = opaque
-    // readable fallback, <255 lets a mica/acrylic backdrop read through).
+    // radius in device px; `surfaceAlpha` is the *background* alpha (255 = opaque
+    // readable fallback, <255 lets a mica/acrylic backdrop read through). Text
+    // and border pixels are forced to full opacity by maskRoundedCorners so the
+    // card stays legible over a bright acrylic material in either theme.
     void endCard(HDC memdc, HBITMAP old, int width, int height, int x, int y,
                  theme::ThemeMode mode, theme::Backdrop backdrop, int radius,
-                 unsigned char surfaceAlpha);
+                 unsigned char surfaceAlpha, const theme::Rgb& bg);
 
-    // Force the DIB's alpha channel: 255 inside the rounded rect (so the card
-    // is opaque/masked) and 0 in the four corners (so they composite as
-    // transparent). Required because GDI fill/text do not set the alpha channel
-    // on a 32bpp DIB — without this pass the whole card composites invisible.
+    // Finalize the DIB's alpha channel:
+    //   * four corner circles -> alpha 0 (transparent punch-out, masked corners)
+    //   * pixels matching the card background color -> alpha = surfaceAlpha
+    //     (translucent so the acrylic reads through)
+    //   * every other pixel (text, border, hairline) -> alpha 255 (fully opaque,
+    //     so the card stays readable in dark mode over bright acrylic)
+    // GDI fill/text leave alpha at 0, so without this the whole card composites
+    // invisible; with the old blanket pass, text was also dimmed and vanished in
+    // dark mode. Splitting by background color fixes both.
     void maskRoundedCorners(int width, int height, int radius,
-                           unsigned char insideAlpha);
+                           unsigned char surfaceAlpha, const theme::Rgb& bg);
+
+    // Draw a title line (semibold, slightly larger) then return the y offset for
+    // the next body line. Gives transient UI the title/body hierarchy Win11
+    // Flyout/TeachingTip surfaces have, instead of a flat stack of equal lines.
+    int drawTitle(HDC memdc, const wchar_t* text, const RECT& rc) const;
 
     // OS dark-mode preference read live from the Personalize registry so the
     // HUD re-themes when the user flips the system switch (issue #2 #5).

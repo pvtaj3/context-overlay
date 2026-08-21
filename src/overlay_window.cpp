@@ -286,43 +286,73 @@ void OverlayWindow::replay() {
         showCardAt(lastAnchor_);
 }
 
-// Force the DIB alpha channel: opaque inside the rounded rect, transparent in
-// the corner circles. GDI fill/text leave alpha at 0, so without this the
-// entire card would composite as invisible under AC_SRC_ALPHA.
+// Finalize the DIB alpha channel. Pixels matching the card background color get
+// the translucent surfaceAlpha (so the acrylic reads through); everything else
+// (text, hairline border) becomes fully opaque. Corner circles are punched to
+// alpha 0. This is what makes text legible in dark mode over bright acrylic —
+// the old blanket pass dimmed text to surfaceAlpha and it vanished.
 void OverlayWindow::maskRoundedCorners(int width, int height, int radius,
-                                       unsigned char insideAlpha) {
+                                       unsigned char surfaceAlpha,
+                                       const theme::Rgb& bg) {
     if (!dibBits_) return;
     auto* px = static_cast<unsigned char*>(dibBits_);  // BGRA, top-down
     const int r = std::max(radius, 0);
 
-    // Default: every pixel opaque at `insideAlpha`.
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            px[(y * width + x) * 4 + 3] = insideAlpha;
-        }
-    }
-    if (r <= 0) return;  // square card, no corner punch-out needed
-
-    // Punch transparent holes in the four corners (Euclidean inside the circle).
-    const int r2 = r * r;
-    auto insideCorner = [&](int cx, int cy, int x, int y) {
-        const int dx = x - cx, dy = y - cy;
-        return (dx * dx + dy * dy) > r2;
+    // Background match tolerance (GDI antialiasing can shift edge pixels a little,
+    // but text/border colors are far enough from bg that 16/255 is safe).
+    const int tol = 16;
+    auto isBg = [&](int i) {
+        const int dr = px[i] - bg.b, dg = px[i + 1] - bg.g, db = px[i + 2] - bg.r;
+        return std::abs(dr) <= tol && std::abs(dg) <= tol && std::abs(db) <= tol;
     };
+
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
+            const int i = (y * width + x) * 4;
+            // Corner punch-out takes priority.
             bool transparent = false;
-            if (x < r && y < r)
-                transparent = insideCorner(r, r, x, y);          // top-left
-            else if (x >= width - r && y < r)
-                transparent = insideCorner(width - r, r, x, y);   // top-right
-            else if (x < r && y >= height - r)
-                transparent = insideCorner(r, height - r, x, y);  // bottom-left
-            else if (x >= width - r && y >= height - r)
-                transparent = insideCorner(width - r, height - r, x, y);  // BR
-            if (transparent) px[(y * width + x) * 4 + 3] = 0;
+            if (r > 0) {
+                const int r2 = r * r;
+                auto insideCorner = [&](int cx, int cy) {
+                    const int dx = x - cx, dy = y - cy;
+                    return (dx * dx + dy * dy) > r2;
+                };
+                if (x < r && y < r)
+                    transparent = insideCorner(r, r);
+                else if (x >= width - r && y < r)
+                    transparent = insideCorner(width - r, r);
+                else if (x < r && y >= height - r)
+                    transparent = insideCorner(r, height - r);
+                else if (x >= width - r && y >= height - r)
+                    transparent = insideCorner(width - r, height - r);
+            }
+            if (transparent) {
+                px[i + 3] = 0;
+            } else {
+                // Content pixels (anything not background) stay fully opaque.
+                px[i + 3] = isBg(i) ? surfaceAlpha : 255;
+            }
         }
     }
+}
+
+// Draw a title line (semibold, slightly larger) and return the y offset (in px
+// from the card top) where the next body line should start. Gives the card a
+// title/body hierarchy like native Win11 transient UI.
+int OverlayWindow::drawTitle(HDC memdc, const wchar_t* text,
+                             const RECT& rc) const {
+    LOGFONTW lf{};
+    if (!GetObjectW(font_, sizeof(lf), &lf)) lf.lfHeight = -18;
+    lf.lfHeight = -18;            // ~13.5pt: a touch larger than body
+    lf.lfWeight = FW_SEMIBOLD;    // title weight
+    HFONT titleFont = CreateFontIndirectW(&lf);
+    HGDIOBJ old = SelectObject(memdc, titleFont);
+    RECT tr = rc;
+    DrawTextW(memdc, text, -1, &tr, DT_LEFT | DT_SINGLELINE);
+    SelectObject(memdc, old);
+    DeleteObject(titleFont);
+    // Advance ~26px below the title baseline for the first body line.
+    return (rc.top + 26);
 }
 
 // Composite the painted DIB as a layered, click-through, topmost surface and
@@ -332,9 +362,11 @@ void OverlayWindow::maskRoundedCorners(int width, int height, int radius,
 void OverlayWindow::endCard(HDC memdc, HBITMAP old, int width, int height,
                             int x, int y, theme::ThemeMode mode,
                             theme::Backdrop backdrop, int radius,
-                            unsigned char surfaceAlpha) {
+                            unsigned char surfaceAlpha, const theme::Rgb& bg) {
     // Mask the rounded corners into the alpha channel before compositing.
-    maskRoundedCorners(width, height, radius, surfaceAlpha);
+    // Background pixels -> translucent surfaceAlpha (acrylic reads through);
+    // text/border pixels -> full opacity (legible in dark mode over bright glass).
+    maskRoundedCorners(width, height, radius, surfaceAlpha, bg);
 
     POINT ptSrc{0, 0};
     POINT ptPos{x, y};
@@ -398,22 +430,26 @@ void OverlayWindow::showCardAt(POINT anchor) {
     HBITMAP old{};
     HDC memdc = beginCard(w, h, tokens, radius, old);
 
-    wchar_t line1[64];
-    wsprintfW(line1, L"Context Overlay  -  Phase 1");
+    // Title (accent color, semibold) + body (neutral). Gives the card the
+    // title/body hierarchy native transient UI has, instead of a flat line stack.
+    RECT rc{0, 0, w, h};
+    rc.left += 12;
+    rc.top += 12;
+
+    SetTextColor(memdc, toColorref(tokens.accent));
+    int bodyY = drawTitle(memdc, L"Context Overlay", rc);
+
     wchar_t line2[64];
     wsprintfW(line2, L"Dwell @ (%ld, %ld)", anchor.x, anchor.y);
-
-    RECT textRc{0, 0, w, h};
-    textRc.left += 12;
-    textRc.top += 12;
-    DrawTextW(memdc, line1, -1, &textRc, DT_LEFT);
-    textRc.top += 22;
-    DrawTextW(memdc, line2, -1, &textRc, DT_LEFT);
+    RECT body{rc.left, bodyY, w, h};
+    SetTextColor(memdc, toColorref(tokens.cardText));
+    DrawTextW(memdc, line2, -1, &body, DT_LEFT);
 
     lastAnchor_ = anchor;
     lastIsIdentity_ = false;
     visible_ = true;
-    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha);
+    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha,
+            tokens.cardBg);
 }
 
 void OverlayWindow::showIdentity(const HoverTarget& target) {
@@ -444,39 +480,38 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     HBITMAP old{};
     HDC memdc = beginCard(w, h, tokens, radius, old);
 
-    wchar_t l1[96];
-    wsprintfW(l1, L"Phase 2  -  identity");
-    wchar_t l2[96];
-    // _snwprintf, not wsprintfW: the Win32 formatter does not support %016llX,
-    // so the element hash previously rendered as garbage.
-    _snwprintf(l2, 96, L"hwnd=0x%p  hash=%016llX",
-               static_cast<void*>(target.hwnd),
-               static_cast<unsigned long long>(target.elementHash));
-
     RECT rc{0, 0, w, h};
     rc.left += 12;
     rc.top += 12;
-    DrawTextW(memdc, l1, -1, &rc, DT_LEFT);
-    rc.top += 22;
-    DrawTextW(memdc, l2, -1, &rc, DT_LEFT);
 
-    // Telemetry line: makes dwell / identity-fail / cancel counts observable at
-    // runtime. Without this the identityFail fix cannot be confirmed by running
-    // the app at all.
+    // Title
+    SetTextColor(memdc, toColorref(tokens.accent));
+    int bodyY = drawTitle(memdc, L"Hover identity", rc);
+
+    // Body: the resolved element hash (emphasis) then the telemetry line.
+    SetTextColor(memdc, toColorref(tokens.cardText));
+    wchar_t l2[96];
+    _snwprintf(l2, 96, L"hwnd=0x%p  hash=%016llX",
+               static_cast<void*>(target.hwnd),
+               static_cast<unsigned long long>(target.elementHash));
+    RECT rc2{rc.left, bodyY, w, h};
+    DrawTextW(memdc, l2, -1, &rc2, DT_LEFT);
+
     if (counters_) {
         wchar_t l3[96];
         _snwprintf(l3, 96, L"dwell=%llu  fail=%llu  cancel=%llu",
                    static_cast<unsigned long long>(counters_->dwell),
                    static_cast<unsigned long long>(counters_->identityFail),
                    static_cast<unsigned long long>(counters_->cancel));
-        rc.top += 22;
-        DrawTextW(memdc, l3, -1, &rc, DT_LEFT);
+        RECT rc3{rc.left, bodyY + 22, w, h};
+        DrawTextW(memdc, l3, -1, &rc3, DT_LEFT);
     }
 
     lastTarget_ = target;
     lastIsIdentity_ = true;
     visible_ = true;
-    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha);
+    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha,
+            tokens.cardBg);
 }
 
 void OverlayWindow::hide() {
