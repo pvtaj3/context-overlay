@@ -40,10 +40,24 @@ constexpr Rgb rgb(unsigned char r, unsigned char g, unsigned char b) {
 
 // Built-in palette for one mode. Text colors are chosen so text-on-bg contrast
 // is >= kMinTextContrast in BOTH modes.
+//
+// The palette mirrors the Win11/WinUI *Card* tokens rather than a generic
+// accent rectangle:
+//   * cardBg is a near-neutral surface (light: #F3F3F3-ish; dark: #2B2B2B-ish)
+//     — deliberately NOT a saturated blue, so the card reads as a system
+//     surface, not a branded banner.
+//   * cardText is high-contrast neutral text (not pure white/black, which is
+//     harsher than WinUI's actual text tokens).
+//   * accent is the system-UI blue but only used for the identity hash /
+//     emphasis glyph, never the card border.
+//   * cardStroke is the faint 1px hairline (WinUI CardStrokeColor) that frames
+//     real transient UI (Flyout/TeachingTip/ContextMenu). It is a low-contrast
+//     neutral derived from the surface — NOT the old hard blue frame.
 struct ThemeTokens {
-    Rgb cardBg;    // card surface (also the readable fallback when no backdrop)
-    Rgb cardText;  // primary text on the card
-    Rgb accent;    // border / accent (decorative; not used for body text)
+    Rgb cardBg;       // card surface (also the readable fallback when no backdrop)
+    Rgb cardText;     // primary text on the card
+    Rgb accent;       // emphasis / hash glyph color (decorative)
+    Rgb cardStroke;   // 1px hairline border (WinUI CardStrokeColor)
 };
 
 // WCAG relative luminance of an sRGB triple.
@@ -78,13 +92,15 @@ inline bool textContrastOk(Rgb text, Rgb bg) {
 // tokens are returned regardless of which material is behind the card.
 inline ThemeTokens resolveTheme(ThemeMode mode) {
     if (mode == ThemeMode::kLight) {
-        // Windows 11 mica-light neutral surface with near-black text.
-        return ThemeTokens{rgb(245, 245, 247), rgb(32, 32, 32),
-                           rgb(0, 120, 212)};
+        // Windows 11 light card: neutral surface, near-black text, faint gray
+        // stroke, system-blue accent for emphasis only.
+        return ThemeTokens{rgb(243, 243, 243), rgb(32, 32, 32),
+                           rgb(0, 120, 212), rgb(141, 141, 141)};
     }
-    // Dark: Win11 mica-dark neutral surface with near-white text.
-    return ThemeTokens{rgb(32, 32, 32), rgb(240, 240, 240),
-                       rgb(96, 165, 250)};
+    // Dark: Win11 dark card surface (#2B2B2B-ish), near-white text, faint
+    // lighter stroke, lighter system-blue accent.
+    return ThemeTokens{rgb(43, 43, 43), rgb(242, 242, 242),
+                       rgb(96, 165, 250), rgb(90, 90, 90)};
 }
 
 // When the system cannot provide a backdrop material, we fall back to an opaque

@@ -52,11 +52,14 @@ void enableDpiAwareness() {
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-// DWM_SYSTEMBACKDROP_TYPE values (subset we use).
+// DWM_SYSTEMBACKDROP_TYPE values (subset we use). Transient/overlay UI (Flyout,
+// TeachingTip, MenuFlyout, tooltips) is documented to use the Acrylic
+// (TRANSIENTWINDOW) material; Mica (MAINWINDOW) is for long-lived app windows.
+// This card is a transient hover surface, so we default to Acrylic.
 enum class DwmBackdrop : DWORD {
-    kNone = 1,
-    kMica = 2,
-    kAcrylic = 3,
+    kNone = 1,      // DWMSBT_NONE
+    kMica = 2,      // DWMSBT_MAINWINDOW
+    kAcrylic = 3,   // DWMSBT_TRANSIENTWINDOW
 };
 
 enum class DwmCorner : DWORD {
@@ -96,9 +99,12 @@ void applyWin11Backdrop(HWND hwnd, theme::ThemeMode mode,
     const BOOL immersive = (mode == theme::ThemeMode::kDark) ? TRUE : FALSE;
     setAttr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &immersive, sizeof(immersive));
 
-    // System backdrop material. kNone means "no backdrop API" — we keep the GDI
-    // card's solid, readable surface instead (see effectiveBackdrop()).
-    DwmBackdrop dwmBackdrop = DwmBackdrop::kNone;
+    // System backdrop material. This card is transient overlay UI, so Acrylic
+    // (DWMSBT_TRANSIENTWINDOW) is the documented material — it matches native
+    // Flyout/TeachingTip surfaces. We request it via the SYSTEMBACKDROP_TYPE
+    // attribute; on systems without it (Win10 / composition disabled) the call is
+    // a no-op and we keep the GDI card's own translucent surface.
+    DwmBackdrop dwmBackdrop = DwmBackdrop::kAcrylic;
     switch (backdrop) {
         case theme::Backdrop::kMica:
             dwmBackdrop = DwmBackdrop::kMica;
@@ -150,7 +156,7 @@ bool OverlayWindow::create(HINSTANCE instance) {
     wc.lpfnWndProc = wndProc;
     wc.hInstance = instance;
     wc.lpszClassName = L"ContextOverlayWindow";
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
     // No cursor: we are a transparent overlay and must not advertise
     // interactivity to the user or the shell.
     wc.hCursor = nullptr;
@@ -212,29 +218,44 @@ HDC OverlayWindow::beginCard(int width, int height,
     SelectClipRgn(memdc, clip);
     DeleteObject(clip);
 
-    // Card surface.
+    // Card surface — a translucent tint so the DWM acrylic backdrop reads
+    // through (native transient UI is not an opaque rectangle). Text contrast is
+    // preserved because the tint is near-opaque; the material shows at the edges
+    // and in any non-text area.
     HBRUSH bg = CreateSolidBrush(toColorref(tokens.cardBg));
     RECT rc{0, 0, width, height};
     FillRect(memdc, &rc, bg);
     DeleteObject(bg);
 
-    // Accent border, inset by 1px so it is not clipped away by the corner mask.
-    HBRUSH border = CreateSolidBrush(toColorref(tokens.accent));
-    RECT br{1, 1, width - 1, height - 1};
-    FrameRect(memdc, &br, border);
-    DeleteObject(border);
+    // Hairline border: a 1px inner stroke in the neutral CardStroke tint
+    // (WinUI Flyout/TeachingTip framing), NOT a saturated accent frame. Drawn
+    // inset by 1px so it survives the rounded-corner clip. Use a thin pen
+    // rather than FrameRect so we control the exact 1px weight and color.
+    HPEN borderPen = CreatePen(PS_SOLID, 1, toColorref(tokens.cardStroke));
+    HGDIOBJ oldPen = SelectObject(memdc, borderPen);
+    // Draw a rectangle one pixel inside the clip region (which is already
+    // rounded), so only the hairline shows, not a filled frame.
+    Rectangle(memdc, 1, 1, width - 1, height - 1);
+    SelectObject(memdc, oldPen);
+    DeleteObject(borderPen);
 
-    // System UI font (Segoe UI on Win11) from NONCLIENTMETRICS, sized for the
-    // card and DPI. Replaced each present because the chosen size is per-card.
+    // System UI font. Win11's real UI face is "Segoe UI Variable"; fall back to
+    // "Segoe UI" (and then the message font) if absent. Sized for the card and
+    // DPI. Replaced each present because the chosen size is per-card.
     if (font_) DeleteObject(font_);
-    NONCLIENTMETRICSW ncm{};
-    ncm.cbSize = sizeof(ncm);
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        LOGFONTW lf = ncm.lfMessageFont;
-        lf.lfHeight = -16;  // ~12pt at 96 DPI; GDI scales by the DC's DPI
-        font_ = CreateFontIndirectW(&lf);
-    } else {
-        font_ = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    LOGFONTW lf{};
+    lf.lfHeight = -16;  // ~12pt at 96 DPI; GDI scales by the DC's DPI
+    lf.lfWeight = FW_NORMAL;
+    lf.lfQuality = CLEARTYPE_QUALITY;  // matches Win11 text rendering
+    lf.lfCharSet = DEFAULT_CHARSET;
+    // Prefer the real Win11 face; older systems ignore the unknown name and
+    // keep the empty lfFaceName (which maps to the system default UI font).
+    wcscpy_s(lf.lfFaceName, L"Segoe UI Variable");
+    font_ = CreateFontIndirectW(&lf);
+    if (!font_) {
+        LOGFONTW lf2 = lf;
+        wcscpy_s(lf2.lfFaceName, L"Segoe UI");
+        font_ = CreateFontIndirectW(&lf2);
     }
     SelectObject(memdc, font_);
     SetBkMode(memdc, TRANSPARENT);
@@ -365,13 +386,14 @@ void OverlayWindow::showCardAt(POINT anchor) {
     const theme::ThemeMode mode = theme::selectMode(true, systemPrefersDark());
     const theme::ThemeTokens tokens = theme::resolveTheme(mode);
     // Backdrop capability: assume supported on this build; the DWM call itself
-    // is a no-op on platforms lacking the API.
+    // is a no-op on platforms lacking the API. Acrylic (transient-UI material)
+    // matches native Flyout/TeachingTip surfaces.
     const theme::Backdrop backdrop =
-        theme::effectiveBackdrop(theme::Backdrop::kMica, true);
-    // Opaque when no material backs us; slightly translucent so mica/acrylic
-    // reads through without harming the WCAG-contrast text.
+        theme::effectiveBackdrop(theme::Backdrop::kAcrylic, true);
+    // Slightly translucent so the acrylic material reads through without harming
+    // the WCAG-contrast text.
     const unsigned char surfaceAlpha =
-        (backdrop == theme::Backdrop::kNone) ? 255 : 235;
+        (backdrop == theme::Backdrop::kNone) ? 255 : 210;
 
     HBITMAP old{};
     HDC memdc = beginCard(w, h, tokens, radius, old);
@@ -415,9 +437,9 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     const theme::ThemeMode mode = theme::selectMode(true, systemPrefersDark());
     const theme::ThemeTokens tokens = theme::resolveTheme(mode);
     const theme::Backdrop backdrop =
-        theme::effectiveBackdrop(theme::Backdrop::kMica, true);
+        theme::effectiveBackdrop(theme::Backdrop::kAcrylic, true);
     const unsigned char surfaceAlpha =
-        (backdrop == theme::Backdrop::kNone) ? 255 : 235;
+        (backdrop == theme::Backdrop::kNone) ? 255 : 210;
 
     HBITMAP old{};
     HDC memdc = beginCard(w, h, tokens, radius, old);
