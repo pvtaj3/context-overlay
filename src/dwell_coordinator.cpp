@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "config.h"
+#include "diag.h"
 #include "uia_identity.h"
 
 namespace {
@@ -36,13 +37,34 @@ void resolveIdentityAndReport(std::shared_ptr<DwellCoordinator::Shared> shared,
         return;
     }
 
+    diag::logf(L"worker: probing (%d,%d) gen=%llu coHr=0x%08lX",
+               static_cast<int>(point.x), static_cast<int>(point.y),
+               static_cast<unsigned long long>(generation),
+               static_cast<unsigned long>(coHr));
+
+    // Measure the probe so the deadline fix is provable from the log rather than
+    // merely survivable: against a hung provider this must land near
+    // kUiaDeadlineMs, not at the UIA default of roughly two minutes.
+    const ULONGLONG probeStart = GetTickCount64();
     auto identity = identifyAt(point, config::kUiaDeadlineMs);
+    const ULONGLONG probeMs = GetTickCount64() - probeStart;
+
+    diag::logf(L"worker: probe took %llu ms (deadline=%lu)%s",
+               static_cast<unsigned long long>(probeMs),
+               static_cast<unsigned long>(config::kUiaDeadlineMs),
+               probeMs > (config::kUiaDeadlineMs * 3)
+                   ? L"  *** DEADLINE OVERRUN ***"
+                   : L"");
 
     if (!identity) {
         // Resolution genuinely failed (no UIA, protected surface, deadline hit
         // with nothing readable). Count it exactly once, whether or not the
         // hover is still current — the failure happened either way.
         ++shared->telemetry.identityFail;
+        diag::logf(L"worker: identify FAILED gen=%llu (identityFail=%llu)",
+                   static_cast<unsigned long long>(generation),
+                   static_cast<unsigned long long>(
+                       shared->telemetry.identityFail.load()));
     } else {
         // Arbitration: if the hover was superseded or the coordinator is gone,
         // drop the result. UIA objects are released inside identifyAt.
@@ -62,8 +84,20 @@ void resolveIdentityAndReport(std::shared_ptr<DwellCoordinator::Shared> shared,
             if (PostMessageW(shared->uiWindow,
                              DwellCoordinator::kDwellResultMessage, 0,
                              reinterpret_cast<LPARAM>(payload.get()))) {
+                diag::logf(L"worker: posted gen=%llu hash=%016llX",
+                           static_cast<unsigned long long>(generation),
+                           static_cast<unsigned long long>(
+                               identity->elementHash));
                 payload.release();
+            } else {
+                diag::logf(L"worker: PostMessage FAILED err=%lu",
+                           GetLastError());
             }
+        } else {
+            diag::logf(L"worker: dropped stale result gen=%llu current=%llu",
+                       static_cast<unsigned long long>(generation),
+                       static_cast<unsigned long long>(
+                           shared->generation.load()));
         }
     }
 
@@ -81,9 +115,16 @@ bool DwellCoordinator::deliverPosted(WPARAM /*wp*/, LPARAM lp) {
     // Re-check arbitration: the cursor may have moved between the post and the
     // pump picking it up.
     if (!shared.alive.load()) return false;
-    if (shared.generation.load() != payload->generation) return false;
+    if (shared.generation.load() != payload->generation) {
+        diag::logf(L"deliver: stale gen=%llu current=%llu (dropped)",
+                   static_cast<unsigned long long>(payload->generation),
+                   static_cast<unsigned long long>(shared.generation.load()));
+        return false;
+    }
     if (!shared.onDwell) return false;
 
+    diag::logf(L"deliver: presenting gen=%llu",
+               static_cast<unsigned long long>(payload->generation));
     shared.onDwell(payload->target, payload->generation);
     return true;
 }
@@ -123,6 +164,10 @@ void DwellCoordinator::sample(POINT point) {
                     now - stableSince_) >= dwell_) {
                 state_ = State::Fired;
                 ++shared->telemetry.dwellFired;
+                diag::logf(L"dwell FIRED at (%d,%d) gen=%llu",
+                           static_cast<int>(point.x), static_cast<int>(point.y),
+                           static_cast<unsigned long long>(
+                               shared->generation.load()));
                 const uint64_t gen = shared->generation.load();
                 const auto since = stableSince_;
                 // Detached worker: keeps `shared` alive, never blocks the UI

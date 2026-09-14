@@ -1,9 +1,16 @@
 #include "overlay_window.h"
 #include "config.h"
+#include "diag.h"
+#include "theme_tokens.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cwchar>
 
 #include <windows.h>
 
 namespace {
+
 constexpr UINT WM_SHOW_CARD = WM_APP + 1;
 constexpr UINT WM_HIDE_CARD = WM_APP + 2;
 
@@ -26,6 +33,119 @@ void enableDpiAwareness() {
     }
     SetProcessDPIAware();
 }
+
+// --- Windows 11 / WinUI DWM glue (issue #2) ----------------------------------
+//
+// These attributes and color values are resolved dynamically so the binary
+// builds against older SDKs and still lights up the native styling on Windows
+// 11. On systems that lack them (Win10, disabled composition) we take the
+// documented graceful fallbacks and rely on the GDI card's own palette.
+
+// DWM window attributes for system backdrop material + rounded corners.
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+
+// DWM_SYSTEMBACKDROP_TYPE values (subset we use). Transient/overlay UI (Flyout,
+// TeachingTip, MenuFlyout, tooltips) is documented to use the Acrylic
+// (TRANSIENTWINDOW) material; Mica (MAINWINDOW) is for long-lived app windows.
+// This card is a transient hover surface, so we default to Acrylic.
+enum class DwmBackdrop : DWORD {
+    kNone = 1,      // DWMSBT_NONE
+    kMica = 2,      // DWMSBT_MAINWINDOW
+    kAcrylic = 3,   // DWMSBT_TRANSIENTWINDOW
+};
+
+enum class DwmCorner : DWORD {
+    kDefault = 0,
+    kRound = 2,
+    kRoundSmall = 3,
+};
+
+using DwmSetAttrFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+
+DwmSetAttrFn getDwmSetWindowAttribute() {
+    HMODULE dwm = GetModuleHandleW(L"dwmapi.dll");
+    if (!dwm) return nullptr;
+    return reinterpret_cast<DwmSetAttrFn>(reinterpret_cast<void*>(
+        GetProcAddress(dwm, "DwmSetWindowAttribute")));
+}
+
+// Apply the Win11-native look: rounded corners, immersive dark mode to match
+// the chosen theme, and a system backdrop material (mica/acrylic) when the
+// platform supports it. Every call is guarded by a runtime capability check so
+// an absent API degrades to the GDI card's opaque fallback without error.
+void applyWin11Backdrop(HWND hwnd, theme::ThemeMode mode,
+                        theme::Backdrop backdrop) {
+    auto setAttr = getDwmSetWindowAttribute();
+    if (!setAttr) {
+        diag::logf(L"win11: DwmSetWindowAttribute unavailable; GDI fallback "
+                    L"(square corners, opaque card)");
+        return;  // older OS: GDI palette + square corners are fine
+    }
+
+    // Rounded corners — the heart of the Win11 silhouette.
+    const DwmCorner cornerPref = DwmCorner::kRound;
+    setAttr(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPref,
+            sizeof(cornerPref));
+
+    // Immersive dark mode so the non-client/backdrop tints follow our theme.
+    const BOOL immersive = (mode == theme::ThemeMode::kDark) ? TRUE : FALSE;
+    setAttr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &immersive, sizeof(immersive));
+
+    // System backdrop material. This card is transient overlay UI, so Acrylic
+    // (DWMSBT_TRANSIENTWINDOW) is the documented material — it matches native
+    // Flyout/TeachingTip surfaces. We request it via the SYSTEMBACKDROP_TYPE
+    // attribute; on systems without it (Win10 / composition disabled) the call is
+    // a no-op and we keep the GDI card's own translucent surface.
+    DwmBackdrop dwmBackdrop = DwmBackdrop::kAcrylic;
+    switch (backdrop) {
+        case theme::Backdrop::kMica:
+            dwmBackdrop = DwmBackdrop::kMica;
+            break;
+        case theme::Backdrop::kAcrylic:
+            dwmBackdrop = DwmBackdrop::kAcrylic;
+            break;
+        case theme::Backdrop::kNone:
+        default:
+            dwmBackdrop = DwmBackdrop::kNone;
+            break;
+    }
+    setAttr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &dwmBackdrop, sizeof(dwmBackdrop));
+
+    const wchar_t* bd = backdrop == theme::Backdrop::kMica    ? L"mica"
+                       : backdrop == theme::Backdrop::kAcrylic ? L"acrylic"
+                                                               : L"none";
+    diag::logf(L"win11: corner=round immersive=%d backdrop=%s",
+               immersive ? 1 : 0, bd);
+}
+
+// Per-monitor DPI for the overlay's own window (we are PMv2-aware). Falls back
+// to system DPI when the per-window API is unavailable, so corner radii and
+// typography scale correctly regardless of which monitor the card lands on.
+UINT currentDpi(HWND hwnd) {
+    using GetDpiFn = UINT(WINAPI*)(HWND);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        auto f = reinterpret_cast<GetDpiFn>(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetDpiForWindow")));
+        if (f) return f(hwnd);
+    }
+    return GetDpiForSystem();
+}
+
+// COLORREF is BGR; our token Rgb is RGB. Convert so layout assumptions never
+// leak from the platform-neutral header into the renderer.
+constexpr COLORREF toColorref(theme::Rgb c) {
+    return RGB(c.r, c.g, c.b);
+}
+
 }  // namespace
 
 bool OverlayWindow::create(HINSTANCE instance) {
@@ -36,7 +156,7 @@ bool OverlayWindow::create(HINSTANCE instance) {
     wc.lpfnWndProc = wndProc;
     wc.hInstance = instance;
     wc.lpszClassName = L"ContextOverlayWindow";
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
     // No cursor: we are a transparent overlay and must not advertise
     // interactivity to the user or the shell.
     wc.hCursor = nullptr;
@@ -72,43 +192,208 @@ void OverlayWindow::ensureDib(int width, int height) {
     bi.bmiHeader.biWidth = width;
     bi.bmiHeader.biHeight = -height;  // top-down DIB
     bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biBitCount = 32;     // BGRA: per-pixel alpha for corner masking
     bi.bmiHeader.biCompression = BI_RGB;
     dib_ = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &dibBits_, nullptr, 0);
     width_ = width;
     height_ = height;
 }
 
-void OverlayWindow::paintCard(HDC hdc, int width, int height, POINT anchor) {
-    RECT rc{0, 0, width, height};
+// Paint a themed, rounded, per-pixel-alpha card into the layered DIB. The DIB
+// starts fully transparent; we fill only inside the rounded rectangle, so the
+// composited surface is genuinely masked — no square corners survive.
+HDC OverlayWindow::beginCard(int width, int height,
+                             const theme::ThemeTokens& tokens, int radius,
+                             HBITMAP& outOld) {
+    ensureDib(width, height);
 
-    // Card background.
-    HBRUSH bg = CreateSolidBrush(RGB(26, 27, 33));
-    FillRect(hdc, &rc, bg);
+    // The DIB is created transparent (CreateDIBSection zeroes it), so outside
+    // the rounded rect stays alpha 0.
+
+    HDC memdc = CreateCompatibleDC(nullptr);
+    outOld = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
+
+    // Rounded-rect clip so text/border never spill past the masked corners.
+    HRGN clip = CreateRoundRectRgn(0, 0, width, height, radius * 2, radius * 2);
+    SelectClipRgn(memdc, clip);
+    DeleteObject(clip);
+
+    // Card surface — a translucent tint so the DWM acrylic backdrop reads
+    // through (native transient UI is not an opaque rectangle). Text contrast is
+    // preserved because the tint is near-opaque; the material shows at the edges
+    // and in any non-text area.
+    HBRUSH bg = CreateSolidBrush(toColorref(tokens.cardBg));
+    RECT rc{0, 0, width, height};
+    FillRect(memdc, &rc, bg);
     DeleteObject(bg);
 
-    // Accent border.
-    HBRUSH border = CreateSolidBrush(RGB(96, 165, 250));
-    FrameRect(hdc, &rc, border);
-    DeleteObject(border);
+    // Hairline border: a 1px inner stroke in the neutral CardStroke tint
+    // (WinUI Flyout/TeachingTip framing), NOT a saturated accent frame. Drawn
+    // inset by 1px so it survives the rounded-corner clip. Use a thin pen
+    // rather than FrameRect so we control the exact 1px weight and color.
+    HPEN borderPen = CreatePen(PS_SOLID, 1, toColorref(tokens.cardStroke));
+    HGDIOBJ oldPen = SelectObject(memdc, borderPen);
+    // Draw a rectangle one pixel inside the clip region (which is already
+    // rounded), so only the hairline shows, not a filled frame.
+    Rectangle(memdc, 1, 1, width - 1, height - 1);
+    SelectObject(memdc, oldPen);
+    DeleteObject(borderPen);
 
-    // Text.
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(232, 234, 238));
-    HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    SelectObject(hdc, font);
+    // System UI font. Win11's real UI face is "Segoe UI Variable"; fall back to
+    // "Segoe UI" (and then the message font) if absent. Sized for the card and
+    // DPI. Replaced each present because the chosen size is per-card.
+    if (font_) DeleteObject(font_);
+    LOGFONTW lf{};
+    lf.lfHeight = -16;  // ~12pt at 96 DPI; GDI scales by the DC's DPI
+    lf.lfWeight = FW_NORMAL;
+    lf.lfQuality = CLEARTYPE_QUALITY;  // matches Win11 text rendering
+    lf.lfCharSet = DEFAULT_CHARSET;
+    // Prefer the real Win11 face; older systems ignore the unknown name and
+    // keep the empty lfFaceName (which maps to the system default UI font).
+    wcscpy_s(lf.lfFaceName, L"Segoe UI Variable");
+    font_ = CreateFontIndirectW(&lf);
+    if (!font_) {
+        LOGFONTW lf2 = lf;
+        wcscpy_s(lf2.lfFaceName, L"Segoe UI");
+        font_ = CreateFontIndirectW(&lf2);
+    }
+    SelectObject(memdc, font_);
+    SetBkMode(memdc, TRANSPARENT);
+    SetTextColor(memdc, toColorref(tokens.cardText));
 
-    wchar_t line1[64];
-    wsprintfW(line1, L"Context Overlay  -  Phase 1");
-    wchar_t line2[64];
-    wsprintfW(line2, L"Dwell @ (%ld, %ld)", anchor.x, anchor.y);
+    return memdc;
+}
 
-    RECT textRc = rc;
-    textRc.left += 12;
-    textRc.top += 12;
-    DrawTextW(hdc, line1, -1, &textRc, DT_LEFT);
-    textRc.top += 22;
-    DrawTextW(hdc, line2, -1, &textRc, DT_LEFT);
+// Live OS dark-mode preference, read from the Personalize registry. Falls back
+// to the app default if the key is absent, so absence never breaks the overlay.
+bool OverlayWindow::systemPrefersDark() {
+    DWORD value = 0, size = sizeof(value);
+    constexpr wchar_t kPath[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    const LSTATUS s = RegGetValueW(HKEY_CURRENT_USER, kPath,
+                                   L"AppsUseLightTheme", RRF_RT_REG_DWORD,
+                                   nullptr, &value, &size);
+    if (s != ERROR_SUCCESS) return theme::defaultMode() == theme::ThemeMode::kDark;
+    // AppsUseLightTheme=0 -> dark apps. Our card follows the *app* switch.
+    return value == 0;
+}
+
+void OverlayWindow::replay() {
+    if (!visible_) return;
+    if (lastIsIdentity_)
+        showIdentity(lastTarget_);
+    else
+        showCardAt(lastAnchor_);
+}
+
+// Finalize the DIB alpha channel. Pixels matching the card background color get
+// the translucent surfaceAlpha (so the acrylic reads through); everything else
+// (text, hairline border) becomes fully opaque. Corner circles are punched to
+// alpha 0. This is what makes text legible in dark mode over bright acrylic —
+// the old blanket pass dimmed text to surfaceAlpha and it vanished.
+void OverlayWindow::maskRoundedCorners(int width, int height, int radius,
+                                       unsigned char surfaceAlpha,
+                                       const theme::Rgb& bg) {
+    if (!dibBits_) return;
+    auto* px = static_cast<unsigned char*>(dibBits_);  // BGRA, top-down
+    const int r = std::max(radius, 0);
+
+    // Background match tolerance (GDI antialiasing can shift edge pixels a little,
+    // but text/border colors are far enough from bg that 16/255 is safe).
+    const int tol = 16;
+    auto isBg = [&](int i) {
+        const int dr = px[i] - bg.b, dg = px[i + 1] - bg.g, db = px[i + 2] - bg.r;
+        return std::abs(dr) <= tol && std::abs(dg) <= tol && std::abs(db) <= tol;
+    };
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const int i = (y * width + x) * 4;
+            // Corner punch-out takes priority.
+            bool transparent = false;
+            if (r > 0) {
+                const int r2 = r * r;
+                auto insideCorner = [&](int cx, int cy) {
+                    const int dx = x - cx, dy = y - cy;
+                    return (dx * dx + dy * dy) > r2;
+                };
+                if (x < r && y < r)
+                    transparent = insideCorner(r, r);
+                else if (x >= width - r && y < r)
+                    transparent = insideCorner(width - r, r);
+                else if (x < r && y >= height - r)
+                    transparent = insideCorner(r, height - r);
+                else if (x >= width - r && y >= height - r)
+                    transparent = insideCorner(width - r, height - r);
+            }
+            if (transparent) {
+                px[i + 3] = 0;
+            } else {
+                // Content pixels (anything not background) stay fully opaque.
+                px[i + 3] = isBg(i) ? surfaceAlpha : 255;
+            }
+        }
+    }
+}
+
+// Draw a title line (semibold, slightly larger) and return the y offset (in px
+// from the card top) where the next body line should start. Gives the card a
+// title/body hierarchy like native Win11 transient UI.
+int OverlayWindow::drawTitle(HDC memdc, const wchar_t* text,
+                             const RECT& rc) const {
+    LOGFONTW lf{};
+    if (!GetObjectW(font_, sizeof(lf), &lf)) lf.lfHeight = -18;
+    lf.lfHeight = -18;            // ~13.5pt: a touch larger than body
+    lf.lfWeight = FW_SEMIBOLD;    // title weight
+    HFONT titleFont = CreateFontIndirectW(&lf);
+    HGDIOBJ old = SelectObject(memdc, titleFont);
+    RECT tr = rc;
+    DrawTextW(memdc, text, -1, &tr, DT_LEFT | DT_SINGLELINE);
+    SelectObject(memdc, old);
+    DeleteObject(titleFont);
+    // Advance ~26px below the title baseline for the first body line.
+    return (rc.top + 26);
+}
+
+// Composite the painted DIB as a layered, click-through, topmost surface and
+// apply the Win11 DWM attributes. The DIB must remain selected into memdc until
+// after UpdateLayeredWindow (the original Phase 1 bug: deselecting early
+// composited nothing).
+void OverlayWindow::endCard(HDC memdc, HBITMAP old, int width, int height,
+                            int x, int y, theme::ThemeMode mode,
+                            theme::Backdrop backdrop, int radius,
+                            unsigned char surfaceAlpha, const theme::Rgb& bg) {
+    // Mask the rounded corners into the alpha channel before compositing.
+    // Background pixels -> translucent surfaceAlpha (acrylic reads through);
+    // text/border pixels -> full opacity (legible in dark mode over bright glass).
+    maskRoundedCorners(width, height, radius, surfaceAlpha, bg);
+
+    POINT ptSrc{0, 0};
+    POINT ptPos{x, y};
+    SIZE size{width, height};
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = 255;   // full; per-pixel alpha carries the shape
+    bf.AlphaFormat = AC_SRC_ALPHA;  // honor the DIB's alpha channel (corners)
+
+    // Apply the native Win11 framing to the window *before* it is shown so the
+    // first present already has rounded corners + immersive dark mode.
+    applyWin11Backdrop(hwnd_, mode, backdrop);
+
+    diag::logf(L"present: mode=%s dpi=%u radius=%d alpha=%u size=%dx%d "
+                L"pos=(%d,%d)",
+               mode == theme::ThemeMode::kDark ? L"dark" : L"light",
+               static_cast<unsigned>(currentDpi(hwnd_)), radius, surfaceAlpha,
+               width, height, x, y);
+
+    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const BOOL ok = UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc,
+                                        &ptSrc, RGB(0, 0, 0), &bf, ULW_ALPHA);
+    if (!ok) diag::logf(L"UpdateLayeredWindow FAILED err=%lu", GetLastError());
+
+    SelectObject(memdc, old);  // restore only after compositing
+    DeleteDC(memdc);
 }
 
 void OverlayWindow::showCardAt(POINT anchor) {
@@ -126,28 +411,45 @@ void OverlayWindow::showCardAt(POINT anchor) {
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
 
-    ensureDib(w, h);
+    // Theme tokens + scale-aware geometry (issue #2). Follow the OS preference
+    // for now; the runtime preference-change path hooks WM_SETTINGCHANGE.
+    UINT dpi = currentDpi(hwnd_);
+    const int radius = theme::cornerRadiusForDpi(static_cast<int>(dpi));
+    const theme::ThemeMode mode = theme::selectMode(true, systemPrefersDark());
+    const theme::ThemeTokens tokens = theme::resolveTheme(mode);
+    // Backdrop capability: assume supported on this build; the DWM call itself
+    // is a no-op on platforms lacking the API. Acrylic (transient-UI material)
+    // matches native Flyout/TeachingTip surfaces.
+    const theme::Backdrop backdrop =
+        theme::effectiveBackdrop(theme::Backdrop::kAcrylic, true);
+    // Slightly translucent so the acrylic material reads through without harming
+    // the WCAG-contrast text.
+    const unsigned char surfaceAlpha =
+        (backdrop == theme::Backdrop::kNone) ? 255 : 210;
 
-    HDC memdc = CreateCompatibleDC(nullptr);
-    HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
-    paintCard(memdc, w, h, anchor);
-    SelectObject(memdc, old);
+    HBITMAP old{};
+    HDC memdc = beginCard(w, h, tokens, radius, old);
 
-    // Composite the DIB as a layered surface. AlphaFormat = 0 means we use a
-    // single global alpha (kCardAlpha); per-pixel alpha arrives with D2D later.
-    POINT ptSrc{0, 0};
-    POINT ptPos{x, y};
-    SIZE size{w, h};
-    BLENDFUNCTION bf{};
-    bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = config::kCardAlpha;
-    bf.AlphaFormat = 0;
+    // Title (accent color, semibold) + body (neutral). Gives the card the
+    // title/body hierarchy native transient UI has, instead of a flat line stack.
+    RECT rc{0, 0, w, h};
+    rc.left += 12;
+    rc.top += 12;
 
-    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc, &ptSrc,
-                        RGB(0, 0, 0), &bf, ULW_ALPHA);
-    DeleteDC(memdc);
+    SetTextColor(memdc, toColorref(tokens.accent));
+    int bodyY = drawTitle(memdc, L"Context Overlay", rc);
+
+    wchar_t line2[64];
+    wsprintfW(line2, L"Dwell @ (%ld, %ld)", anchor.x, anchor.y);
+    RECT body{rc.left, bodyY, w, h};
+    SetTextColor(memdc, toColorref(tokens.cardText));
+    DrawTextW(memdc, line2, -1, &body, DT_LEFT);
+
+    lastAnchor_ = anchor;
+    lastIsIdentity_ = false;
+    visible_ = true;
+    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha,
+            tokens.cardBg);
 }
 
 void OverlayWindow::showIdentity(const HoverTarget& target) {
@@ -155,7 +457,7 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     // dwell/arbitration behaviour is observable. The real D2D card (Phase 5+)
     // will replace this.
     const int w = config::kCardWidth + 60;
-    const int h = config::kCardHeight + 24;
+    const int h = config::kCardHeight + 46;  // room for the telemetry line
 
     RECT wa{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
@@ -166,54 +468,60 @@ void OverlayWindow::showIdentity(const HoverTarget& target) {
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
 
-    ensureDib(w, h);
+    UINT dpi = currentDpi(hwnd_);
+    const int radius = theme::cornerRadiusForDpi(static_cast<int>(dpi));
+    const theme::ThemeMode mode = theme::selectMode(true, systemPrefersDark());
+    const theme::ThemeTokens tokens = theme::resolveTheme(mode);
+    const theme::Backdrop backdrop =
+        theme::effectiveBackdrop(theme::Backdrop::kAcrylic, true);
+    const unsigned char surfaceAlpha =
+        (backdrop == theme::Backdrop::kNone) ? 255 : 210;
 
-    HDC memdc = CreateCompatibleDC(nullptr);
-    HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(memdc, dib_));
-    paintCard(memdc, w, h, target.screenPoint);
-
-    // Identity text lines (drawn over the base card background).
-    SetBkMode(memdc, TRANSPARENT);
-    SetTextColor(memdc, RGB(232, 234, 238));
-    HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    SelectObject(memdc, font);
-
-    wchar_t l1[96];
-    wsprintfW(l1, L"Phase 2  -  identity");
-    wchar_t l2[96];
-    wsprintfW(l2, L"hwnd=0x%p  hash=%016llX",
-              static_cast<void*>(target.hwnd),
-              static_cast<unsigned long long>(target.elementHash));
+    HBITMAP old{};
+    HDC memdc = beginCard(w, h, tokens, radius, old);
 
     RECT rc{0, 0, w, h};
     rc.left += 12;
     rc.top += 12;
-    DrawTextW(memdc, l1, -1, &rc, DT_LEFT);
-    rc.top += 22;
-    DrawTextW(memdc, l2, -1, &rc, DT_LEFT);
-    SelectObject(memdc, old);
 
-    POINT ptSrc{0, 0};
-    POINT ptPos{x, y};
-    SIZE size{w, h};
-    BLENDFUNCTION bf{};
-    bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = config::kCardAlpha;
-    bf.AlphaFormat = 0;
+    // Title
+    SetTextColor(memdc, toColorref(tokens.accent));
+    int bodyY = drawTitle(memdc, L"Hover identity", rc);
 
-    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    UpdateLayeredWindow(hwnd_, nullptr, &ptPos, &size, memdc, &ptSrc,
-                        RGB(0, 0, 0), &bf, ULW_ALPHA);
-    DeleteDC(memdc);
+    // Body: the resolved element hash (emphasis) then the telemetry line.
+    SetTextColor(memdc, toColorref(tokens.cardText));
+    wchar_t l2[96];
+    _snwprintf(l2, 96, L"hwnd=0x%p  hash=%016llX",
+               static_cast<void*>(target.hwnd),
+               static_cast<unsigned long long>(target.elementHash));
+    RECT rc2{rc.left, bodyY, w, h};
+    DrawTextW(memdc, l2, -1, &rc2, DT_LEFT);
+
+    if (counters_) {
+        wchar_t l3[96];
+        _snwprintf(l3, 96, L"dwell=%llu  fail=%llu  cancel=%llu",
+                   static_cast<unsigned long long>(counters_->dwell),
+                   static_cast<unsigned long long>(counters_->identityFail),
+                   static_cast<unsigned long long>(counters_->cancel));
+        RECT rc3{rc.left, bodyY + 22, w, h};
+        DrawTextW(memdc, l3, -1, &rc3, DT_LEFT);
+    }
+
+    lastTarget_ = target;
+    lastIsIdentity_ = true;
+    visible_ = true;
+    endCard(memdc, old, w, h, x, y, mode, backdrop, radius, surfaceAlpha,
+            tokens.cardBg);
 }
 
 void OverlayWindow::hide() {
+    visible_ = false;
     ShowWindow(hwnd_, SW_HIDE);
 }
 
 OverlayWindow::~OverlayWindow() {
     if (dib_) DeleteObject(dib_);
+    if (font_) DeleteObject(font_);
 }
 
 LRESULT OverlayWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -233,6 +541,13 @@ LRESULT OverlayWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_HIDE_CARD:
             hide();
+            return 0;
+
+        case WM_SETTINGCHANGE:
+            // System theme / color preference changed: re-present the visible
+            // card under the new theme without waiting for the next dwell.
+            diag::logf(L"WM_SETTINGCHANGE received; re-presenting under new theme");
+            replay();
             return 0;
 
         case WM_DESTROY:
